@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Humanoid Teleoperation</title>
+<style>
+  :root {
+    --color-bg: #f4f4f2;
+    --color-text: #1a1a1a;
+    --color-divider: #e2e2dd;
+    --color-neutral-700: #6b6b66;
+    --color-neutral-900: #1a1a1a;
+    --color-accent: #2f6df6;
+    --color-card: #ffffff;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.06), 0 1px 3px rgba(0,0,0,.08);
+    --shadow-lg: 0 10px 30px rgba(0,0,0,.35);
+    --font-heading: "Helvetica Neue", Arial, system-ui, sans-serif;
+    --font-body: system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --color-bg: #17171a;
+      --color-text: #f2f2f0;
+      --color-divider: #2c2c31;
+      --color-neutral-700: #9a9aa0;
+      --color-neutral-900: #050506;
+      --color-card: #1f1f24;
+    }
+  }
+  html, body { margin: 0; height: 100%; background: var(--color-bg); }
+  * { box-sizing: border-box; }
+
+  .app { height:100vh; width:100vw; display:flex; flex-direction:column;
+         background:var(--color-bg); font-family:var(--font-body); overflow:hidden; }
+
+  .topbar { flex:none; padding:20px 32px; border-bottom:2px solid var(--color-divider);
+            display:flex; align-items:baseline; justify-content:space-between; }
+  .topbar h1 { margin:0; font-family:var(--font-heading); font-size:22px; font-weight:700;
+               color:var(--color-text); letter-spacing:-0.01em; }
+  .topbar .sub { font-size:13px; color:var(--color-neutral-700); }
+
+  .body { flex:1; min-height:0; display:grid; grid-template-columns:1fr 320px; }
+
+  .stage { position:relative; min-height:0; border-right:2px solid var(--color-divider);
+           background:var(--color-neutral-900); }
+
+  .feed { overflow:hidden; }
+  .feed img, .feed .ph { width:100%; height:100%; object-fit:cover; display:block; }
+  .feed .ph { display:flex; align-items:center; justify-content:center;
+              background:repeating-linear-gradient(45deg,#232327,#232327 12px,#26262b 12px,#26262b 24px);
+              color:#8a8a90; font-size:13px; letter-spacing:.03em; }
+
+  .feed-main { position:absolute; inset:0; z-index:1; }
+  .feed-pip  { position:absolute; bottom:24px; right:24px; width:300px; height:168px;
+               z-index:2; cursor:pointer; border:2px solid #fff; box-shadow:var(--shadow-lg); }
+
+  .label { position:absolute; z-index:3; background:var(--color-neutral-900); color:#fff;
+           font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
+  .label-main { top:16px; left:16px; padding:5px 10px; font-size:11px; }
+  .label-pip  { top:8px; left:8px; padding:4px 8px; font-size:10px; }
+
+  .side { display:flex; flex-direction:column; padding:24px; gap:20px; min-height:0; overflow:auto; }
+
+  .card { background:var(--color-card); box-shadow:var(--shadow-sm); border-radius:10px; }
+  .kicker { font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+            color:var(--color-neutral-700); }
+
+  .tag { font-size:11px; font-weight:700; letter-spacing:.04em; padding:4px 10px; border-radius:999px; }
+  .tag-neutral { background:var(--color-divider); color:var(--color-neutral-700); }
+  .tag-accent  { background:var(--color-accent); color:#fff; }
+
+  .btn { flex:1; padding:11px 12px; border:none; border-radius:8px; font-size:13px; font-weight:600;
+         cursor:pointer; font-family:var(--font-body); }
+  .btn-primary   { background:var(--color-accent); color:#fff; }
+  .btn-secondary { background:var(--color-divider); color:var(--color-text); }
+  .btn:disabled  { opacity:.4; cursor:not-allowed; }
+
+  .time { font-family:var(--font-heading); font-size:28px; font-weight:700;
+          color:var(--color-text); font-variant-numeric:tabular-nums; }
+
+  .log-list { flex:1; overflow-y:auto; padding:12px 20px; display:flex;
+              flex-direction:column-reverse; gap:8px; }
+  .log-row { display:flex; gap:10px; font-size:12.5px; line-height:1.5; color:var(--color-text); }
+  .log-row .t { font-family:ui-monospace,monospace; color:var(--color-neutral-700); flex:none; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="topbar">
+    <h1>Humanoid Teleoperation</h1>
+    <div class="sub">Simulation &amp; Camera Streaming</div>
+  </div>
+
+  <div class="body">
+    <div class="stage">
+      <!-- main/pip classes swapped by JS -->
+      <div id="mujocoBox" class="feed">
+        <div id="mujocoLabel" class="label">무조코 시뮬레이션</div>
+        <div class="ph" data-feed="mujoco">무조코 시뮬레이션 화면</div>
+      </div>
+      <div id="cameraBox" class="feed">
+        <div id="cameraLabel" class="label">카메라 뷰</div>
+        <div class="ph" data-feed="camera">로봇 카메라 시점</div>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="card" style="padding:20px;display:flex;flex-direction:column;gap:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span class="kicker">상태</span>
+          <span id="statusTag" class="tag tag-neutral">정지됨</span>
+        </div>
+        <div style="display:flex;align-items:baseline;justify-content:space-between;border-top:1px solid var(--color-divider);padding-top:12px">
+          <span style="font-size:12px;color:var(--color-neutral-700)">경과 시간</span>
+          <span id="timeText" class="time">00:00</span>
+        </div>
+        <div style="display:flex;gap:10px">
+          <button id="btnStart" class="btn btn-primary">시작</button>
+          <button id="btnPause" class="btn btn-secondary" disabled>정지</button>
+          <button id="btnStop"  class="btn btn-secondary" disabled>종료</button>
+        </div>
+      </div>
+
+      <div class="card" style="padding:0;display:flex;flex-direction:column;flex:1;min-height:160px">
+        <div style="padding:14px 20px;border-bottom:2px solid var(--color-divider)">
+          <span class="kicker">로그</span>
+        </div>
+        <div id="logList" class="log-list"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const el = id => document.getElementById(id);
+  const state = { status: 'idle', elapsedMs: 0, mainView: 'sim', interval: null };
+
+  const nowStr = () => new Date().toTimeString().slice(0, 8);
+  const fmtTime = ms => {
+    const t = Math.floor(ms / 1000);
+    return String(Math.floor(t / 60)).padStart(2,'0') + ':' + String(t % 60).padStart(2,'0');
+  };
+
+  function addLog(text) {
+    const row = document.createElement('div');
+    row.className = 'log-row';
+    row.innerHTML = '<span class="t"></span><span class="x"></span>';
+    row.querySelector('.t').textContent = nowStr();
+    row.querySelector('.x').textContent = text;
+    // column-reverse: newest first => prepend
+    el('logList').prepend(row);
+  }
+
+  function renderViews() {
+    const simMain = state.mainView === 'sim';
+    const mBox = el('mujocoBox'), cBox = el('cameraBox');
+    const mLbl = el('mujocoLabel'), cLbl = el('cameraLabel');
+    mBox.className = 'feed ' + (simMain ? 'feed-main' : 'feed-pip');
+    cBox.className = 'feed ' + (simMain ? 'feed-pip'  : 'feed-main');
+    mLbl.className = 'label ' + (simMain ? 'label-main' : 'label-pip');
+    cLbl.className = 'label ' + (simMain ? 'label-pip'  : 'label-main');
+    // only pip is clickable (swaps)
+    mBox.onclick = simMain ? null : swapViews;
+    cBox.onclick = simMain ? swapViews : null;
+  }
+  function swapViews() {
+    state.mainView = state.mainView === 'sim' ? 'camera' : 'sim';
+    renderViews();
+  }
+
+  function renderStatus() {
+    const s = state.status;
+    const tag = el('statusTag');
+    tag.textContent = s === 'running' ? '실행 중' : s === 'paused' ? '일시정지' : '정지됨';
+    tag.className = 'tag ' + (s === 'running' ? 'tag-accent' : 'tag-neutral');
+    el('timeText').textContent = fmtTime(state.elapsedMs);
+    el('btnStart').disabled = s === 'running';
+    el('btnPause').disabled = s !== 'running';
+    el('btnStop').disabled  = s === 'idle';
+  }
+
+  const tick = () => { state.elapsedMs += 1000; renderStatus(); };
+
+  el('btnStart').onclick = () => {
+    if (state.status === 'running') return;
+    const resuming = state.status === 'paused';
+    state.status = 'running';
+    addLog(resuming ? '시뮬레이션 재개됨' : '시뮬레이션 시작됨');
+    state.interval = setInterval(tick, 1000);
+    renderStatus();
+  };
+  el('btnPause').onclick = () => {
+    if (state.status !== 'running') return;
+    state.status = 'paused';
+    addLog('시뮬레이션 일시정지됨');
+    clearInterval(state.interval);
+    renderStatus();
+  };
+  el('btnStop').onclick = () => {
+    if (state.status === 'idle') return;
+    state.status = 'idle';
+    state.elapsedMs = 0;
+    addLog('시뮬레이션 종료됨');
+    clearInterval(state.interval);
+    renderStatus();
+  };
+
+  // --- optional: wire real MJPEG/still feeds here ---
+  // To show a live stream, replace the .ph div with:
+  //   <img src="http://<img-server>/mujoco.mjpg"> (or /camera.mjpg)
+  // window.setFeed('mujoco', url) helper:
+  window.setFeed = function (which, url) {
+    const ph = document.querySelector('.ph[data-feed="' + which + '"]');
+    if (!ph) return;
+    const img = document.createElement('img');
+    img.src = url;
+    ph.replaceWith(img);
+    img.setAttribute('data-feed', which);
+  };
+
+  addLog('대시보드 준비 완료');
+  renderViews();
+  renderStatus();
+})();
+</script>
+</body>
+</html>

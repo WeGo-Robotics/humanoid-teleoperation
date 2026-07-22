@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# IDE / editor caches
+.vscode/
+*.vc.db
+
+# Recorded data
+teleop/utils/data/
+
+# OS
+.DS_Store
