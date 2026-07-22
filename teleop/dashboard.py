@@ -724,31 +724,58 @@ class CameraSource(QObject):
     def stop(self):
         self._running = False
 
+    RECONNECT_WAIT = 3.0        # seconds between (re)connect attempts
+    MAX_EMPTY_FRAMES = 90       # ~3s of no frames -> assume dropped, reconnect
+
     def _loop(self):
         try:
             from teleimager.image_client import ImageClient
-            client = ImageClient(host=self._host)
         except Exception as e:
-            self.status.emit(f"카메라 미연결: {e}")
+            self.status.emit(f"카메라 모듈 로드 실패: {e}")
             return
-        self.status.emit("카메라 연결됨")
+        # outer loop: keep (re)connecting until stopped. handles the robot/server
+        # not being up at launch and server restarts mid-session.
         while self._running:
+            client = None
             try:
-                img, _ = client.get_head_frame()
-                if img is not None:
-                    if img.ndim == 2:
-                        img = np.stack([img] * 3, axis=-1)
-                    img = np.ascontiguousarray(img[:, :, ::-1])  # BGR -> RGB
-                    h, w, _ = img.shape
-                    qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-                    self.frame_ready.emit(qimg)
+                client = ImageClient(host=self._host)
+            except Exception:
+                self.status.emit("카메라 연결 시도 중… (서버 대기)")
+                self._sleep(self.RECONNECT_WAIT)
+                continue
+            self.status.emit("카메라 연결됨")
+            empty = 0
+            while self._running:
+                try:
+                    img, _ = client.get_head_frame()
+                    if img is None:
+                        empty += 1
+                        if empty >= self.MAX_EMPTY_FRAMES:
+                            self.status.emit("카메라 끊김 — 재연결")
+                            break            # drop client, reconnect from scratch
+                    else:
+                        empty = 0
+                        if img.ndim == 2:
+                            img = np.stack([img] * 3, axis=-1)
+                        img = np.ascontiguousarray(img[:, :, ::-1])  # BGR -> RGB
+                        h, w, _ = img.shape
+                        qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+                        self.frame_ready.emit(qimg)
+                except Exception:
+                    self.status.emit("카메라 오류 — 재연결")
+                    break
+                time.sleep(1.0 / FPS)
+            try:
+                if client is not None:
+                    client.close()
             except Exception:
                 pass
-            time.sleep(1.0 / FPS)
-        try:
-            client.close()
-        except Exception:
-            pass
+
+    def _sleep(self, seconds):
+        # interruptible sleep so stop() is honored promptly
+        end = time.time() + seconds
+        while self._running and time.time() < end:
+            time.sleep(0.1)
 
 
 # ----------------------------------------------------------------------------
@@ -1493,8 +1520,10 @@ def main():
     p.add_argument("--net", type=str, default=None, help="network interface (e.g. eth0)")
     p.add_argument("--model", type=str, default=None, help="MuJoCo XML path override")
     p.add_argument("--img-server-ip", type=str, default="192.168.123.164")
-    p.add_argument("--camera", action="store_true",
-                   help="enable head-camera PiP via ImageClient")
+    p.add_argument("--camera", action="store_true", default=True,
+                   help="enable head-camera PiP via ImageClient (default on)")
+    p.add_argument("--no-camera", dest="camera", action="store_false",
+                   help="disable the head-camera PiP relay")
     # teleop subprocess launch parameters (used by the 실행 button)
     p.add_argument("--input-mode", type=str, default="controller",
                    choices=["hand", "controller"])
