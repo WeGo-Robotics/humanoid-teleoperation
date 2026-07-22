@@ -103,6 +103,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
 
+    motion_switcher = None   # set in debug mode; used to restore ai mode on exit
+
     try:
         # setup dds communication domains id
         if args.sim:
@@ -539,12 +541,14 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
         try:
-            if not args.motion:
-                pass
-                # status, result = motion_switcher.Exit_Debug_Mode()
-                # logger_mp.info(f"Exit debug mode: {'Success' if status == 3104 else 'Failed'}")
+            # debug(상체) mode: restore ai mode on exit so the remote controller
+            # regains control (remote only works in ai mode). motion(전신) mode
+            # never entered debug, so nothing to restore.
+            if not args.motion and motion_switcher is not None:
+                status, result = motion_switcher.Exit_Debug_Mode()
+                logger_mp.info(f"Restore ai mode: {'Success' if status == 3104 else f'status={status}'}")
         except Exception as e:
-            logger_mp.error(f"Failed to exit debug mode: {e}")
+            logger_mp.error(f"Failed to restore ai mode: {e}")
 
         try:
             if args.sim:
