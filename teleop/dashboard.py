@@ -173,14 +173,18 @@ class MotionModeChecker:
             self._msc = c
         return self._msc
 
+    # motion-service mode name that means the robot is in walking (Regular) mode
+    WALK_MODE = "ai"
+
     def status(self):
-        """Return (ok, walking, name). ok=False => could not query the robot."""
+        """Return (ok, walking, name). ok=False => could not query the robot.
+        walking is True only for the walking-mode name ('ai')."""
         try:
             st, result = self._client().CheckMode()
             if st != 0 or not isinstance(result, dict):
                 return False, False, None
             name = result.get("name", "") or ""
-            return True, bool(name), name
+            return True, name == self.WALK_MODE, name
         except Exception:
             return False, False, None
 
