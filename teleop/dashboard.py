@@ -22,6 +22,7 @@ the teleop heartbeat.
 """
 
 import os
+import signal
 os.environ.setdefault("MUJOCO_GL", "egl")  # headless offscreen GL
 
 import sys
@@ -37,7 +38,8 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QFrame, QSizePolicy, QTextEdit,
+    QFrame, QSizePolicy, QTextEdit, QComboBox, QLineEdit, QToolButton,
+    QButtonGroup, QDialog,
 )
 
 # ----------------------------------------------------------------------------
@@ -69,6 +71,237 @@ C = {
 
 def now_str():
     return datetime.now().strftime("%H:%M:%S")
+
+
+def list_net_ifaces():
+    """Return [(iface, ip), ...] for up IPv4 interfaces, excluding lo/docker.
+    DDS-capable ones (192.168.123.x subnet) are listed first."""
+    import subprocess
+    out = []
+    try:
+        raw = subprocess.check_output(["ip", "-o", "-4", "addr", "show"],
+                                      text=True, timeout=3)
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            iface = parts[1]
+            ip = parts[3].split("/")[0]
+            if iface == "lo" or iface.startswith(("docker", "br-", "veth")):
+                continue
+            out.append((iface, ip))
+    except Exception:
+        pass
+    # DDS subnet (robot link) first
+    out.sort(key=lambda t: (not t[1].startswith("192.168.123."), t[0]))
+    return out
+
+
+def is_dds_ip(ip):
+    return ip.startswith("192.168.123.")
+
+
+class Segmented(QWidget):
+    """Two-or-more segment toggle. .value() returns the selected payload."""
+    changed = pyqtSignal()
+
+    def __init__(self, options, index=0):
+        # options: [(label, value), ...]
+        super().__init__()
+        self._values = [v for _, v in options]
+        self._btns = []
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self._grp = QButtonGroup(self)
+        self._grp.setExclusive(True)
+        for i, (label, _val) in enumerate(options):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setChecked(i == index)
+            b.setFixedHeight(34)
+            self._grp.addButton(b, i)
+            self._btns.append(b)
+            lay.addWidget(b, 1)
+        self._grp.buttonClicked.connect(self._on_click)
+        self._restyle()
+
+    def _on_click(self, _btn):
+        self._restyle()
+        self.changed.emit()
+
+    def _restyle(self):
+        n = len(self._btns)
+        for i, b in enumerate(self._btns):
+            left = "8px" if i == 0 else "0"
+            right = "8px" if i == n - 1 else "0"
+            if b.isChecked():
+                bg, fg, weight = C["accent"], "#fff", 700
+            else:
+                bg, fg, weight = C["divider"], C["neutral700"], 600
+            b.setStyleSheet(
+                f"QPushButton{{background:{bg};color:{fg};border:none;"
+                f"border-top-left-radius:{left};border-bottom-left-radius:{left};"
+                f"border-top-right-radius:{right};border-bottom-right-radius:{right};"
+                f"font-size:12px;font-weight:{weight};padding:0 6px;}}"
+                f"QPushButton:disabled{{color:#b6b6b0;}}")
+
+    def value(self):
+        return self._values[self._grp.checkedId()]
+
+    def set_value(self, val):
+        if val in self._values:
+            i = self._values.index(val)
+            self._btns[i].setChecked(True)
+            self._restyle()
+
+
+class MotionModeChecker:
+    """Query the robot's motion-service mode via MotionSwitcherClient.CheckMode().
+    Walking/Regular mode => result['name'] is non-empty. Debug mode => ''."""
+    def __init__(self):
+        self._msc = None
+
+    def _client(self):
+        if self._msc is None:
+            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
+                MotionSwitcherClient)
+            c = MotionSwitcherClient()
+            c.SetTimeout(0.4)
+            c.Init()
+            self._msc = c
+        return self._msc
+
+    def status(self):
+        """Return (ok, walking, name). ok=False => could not query the robot."""
+        try:
+            st, result = self._client().CheckMode()
+            if st != 0 or not isinstance(result, dict):
+                return False, False, None
+            name = result.get("name", "") or ""
+            return True, bool(name), name
+        except Exception:
+            return False, False, None
+
+
+class WalkModeDialog(QDialog):
+    """Modal overlay shown when '전신' is selected: guides the operator to put the
+    robot into walking (Regular) mode; [계속] enables only once it is detected."""
+    def __init__(self, parent, checker):
+        super().__init__(parent)
+        self._checker = checker
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        dim = QWidget()
+        dim.setStyleSheet("background:rgba(20,20,22,0.48);")
+        outer.addWidget(dim)
+
+        dl = QVBoxLayout(dim)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.addStretch(1)
+        crow = QHBoxLayout()
+        crow.addStretch(1)
+
+        card = QFrame()
+        card.setFixedWidth(380)
+        card.setStyleSheet(f"QFrame{{background:{C['card']};border-radius:16px;}}")
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(28, 28, 28, 24)
+        cv.setSpacing(14)
+
+        icon = QLabel("🚶")
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setStyleSheet("font-size:40px;")
+        cv.addWidget(icon)
+
+        title = QLabel("걷기 모드로 전환해 주세요")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            f"font-size:17px;font-weight:700;color:{C['text']};")
+        cv.addWidget(title)
+
+        body = QLabel("전신(이동) 제어는 로봇이 <b>걷기 모드</b>일 때만 동작합니다.<br>"
+                      "리모컨으로 <b>R1 + X</b> 를 눌러 걷기 모드로 전환하세요.")
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignCenter)
+        body.setStyleSheet(
+            f"font-size:13px;line-height:1.5;color:{C['neutral700']};")
+        cv.addWidget(body)
+
+        # live status pill
+        self._status = QLabel()
+        self._status.setAlignment(Qt.AlignCenter)
+        cv.addWidget(self._status)
+
+        cv.addSpacing(4)
+        brow = QHBoxLayout()
+        brow.setSpacing(10)
+        self._btn_cancel = QPushButton("취소")
+        self._btn_cancel.setCursor(Qt.PointingHandCursor)
+        self._btn_cancel.setFixedHeight(40)
+        self._btn_cancel.setStyleSheet(
+            f"QPushButton{{background:{C['divider']};color:{C['text']};border:none;"
+            f"border-radius:8px;font-size:13px;font-weight:600;}}")
+        self._btn_ok = QPushButton("계속")
+        self._btn_ok.setCursor(Qt.PointingHandCursor)
+        self._btn_ok.setFixedHeight(40)
+        self._btn_ok.setEnabled(False)
+        self._btn_ok.setStyleSheet(
+            f"QPushButton{{background:{C['accent']};color:#fff;border:none;"
+            f"border-radius:8px;font-size:13px;font-weight:700;}}"
+            f"QPushButton:disabled{{background:{C['divider']};color:#aaa;}}")
+        self._btn_cancel.clicked.connect(self.reject)
+        self._btn_ok.clicked.connect(self.accept)
+        brow.addWidget(self._btn_cancel, 1)
+        brow.addWidget(self._btn_ok, 1)
+        cv.addLayout(brow)
+
+        crow.addWidget(card)
+        crow.addStretch(1)
+        dl.addLayout(crow)
+        dl.addStretch(1)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+        self._set_status(None)
+
+    def _set_status(self, walking):
+        # walking: True(green) / False(gray, waiting) / None(red, unknown)
+        if walking is True:
+            dot, txt, col = "●", "걷기 모드 확인됨", "#1f9d55"
+        elif walking is False:
+            dot, txt, col = "●", "걷기 모드 대기 중…", C["neutral700"]
+        else:
+            dot, txt, col = "●", "로봇 상태 확인 불가", "#d64545"
+        self._status.setText(f'<span style="color:{col}">{dot}</span>'
+                             f'<span style="color:{col};font-weight:600">&nbsp;{txt}</span>')
+
+    def _poll(self):
+        ok, walking, _name = self._checker.status()
+        if not ok:
+            self._set_status(None)
+            self._btn_ok.setEnabled(False)
+        else:
+            self._set_status(walking)
+            self._btn_ok.setEnabled(walking)
+
+    def showEvent(self, e):
+        p = self.parent()
+        if p is not None:
+            tl = p.mapToGlobal(p.rect().topLeft())
+            self.setGeometry(tl.x(), tl.y(), p.width(), p.height())
+        self._poll()
+        self._timer.start(500)
+        super().showEvent(e)
+
+    def hideEvent(self, e):
+        self._timer.stop()
+        super().hideEvent(e)
 
 
 # ----------------------------------------------------------------------------
@@ -486,6 +719,8 @@ class Dashboard(QWidget):
         self._phase = "off"            # off | starting | ready | running | paused
         self._elapsed = 0
         self.proc = None
+        self._stop_deadline = None   # time by which the proc group must exit after CMD_STOP
+        self.mode_checker = MotionModeChecker()   # robot walking-mode probe (real robot)
         self._log_signal.connect(self._log)
 
         self._build_ui()
@@ -557,6 +792,7 @@ class Dashboard(QWidget):
         sl.setContentsMargins(24, 24, 24, 24)
         sl.setSpacing(20)
 
+        sl.addWidget(self._settings_card())
         sl.addWidget(self._status_card())
         sl.addWidget(self._log_card(), 1)
 
@@ -568,6 +804,131 @@ class Dashboard(QWidget):
         f.setStyleSheet(
             f"QFrame{{background:{C['card']};border-radius:10px;}}")
         return f
+
+    def _caption(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"font-size:11px;font-weight:700;letter-spacing:.04em;"
+            f"color:{C['neutral700']};")
+        return lbl
+
+    def _settings_card(self):
+        card = self._card()
+        self.settings_card = card
+        v = QVBoxLayout(card)
+        v.setContentsMargins(20, 20, 20, 20)
+        v.setSpacing(14)
+
+        kicker = QLabel("설정")
+        kicker.setStyleSheet(
+            f"font-size:11px;font-weight:700;letter-spacing:.08em;color:{C['neutral700']};")
+        v.addWidget(kicker)
+
+        # 1) VR입력 : --input-mode  (controller | hand)
+        v.addWidget(self._caption("VR입력"))
+        self.set_inputmode = Segmented(
+            [("컨트롤러", "controller"), ("손 추적", "hand")],
+            index=(0 if self.args.input_mode != "hand" else 1))
+        v.addWidget(self.set_inputmode)
+
+        # 2) 제어범위 : --motion  (상체=no motion / 전신=motion)
+        v.addWidget(self._caption("제어범위"))
+        self.set_motion = Segmented(
+            [("상체 (팔만)", False), ("전신 (이동)", True)],
+            index=(1 if self.args.motion else 0))
+        self.set_motion.changed.connect(self._on_motion_changed)
+        v.addWidget(self.set_motion)
+
+        # 3) 네트워크 : --network-interface  (dropdown of live ifaces)
+        v.addWidget(self._caption("네트워크"))
+        self.cmb_net = QComboBox()
+        self.cmb_net.setFixedHeight(34)
+        self.cmb_net.setCursor(Qt.PointingHandCursor)
+        self.cmb_net.setStyleSheet(
+            f"QComboBox{{background:{C['divider']};color:{C['text']};border:none;"
+            f"border-radius:8px;padding:0 12px;font-size:12px;font-weight:600;}}"
+            f"QComboBox::drop-down{{border:none;width:22px;}}"
+            f"QComboBox QAbstractItemView{{background:{C['card']};color:{C['text']};"
+            f"selection-background-color:{C['accent']};selection-color:#fff;"
+            f"border:1px solid {C['divider']};outline:none;}}")
+        self._populate_net()
+        v.addWidget(self.cmb_net)
+
+        # 4) 카메라서버 : --img-server-ip  (read-only + edit toggle)
+        v.addWidget(self._caption("카메라서버"))
+        camrow = QHBoxLayout()
+        camrow.setSpacing(8)
+        self.ed_camip = QLineEdit(self.args.img_server_ip)
+        self.ed_camip.setReadOnly(True)
+        self.ed_camip.setFixedHeight(34)
+        self._style_camip(False)
+        self.btn_camedit = QToolButton()
+        self.btn_camedit.setText("✎")
+        self.btn_camedit.setCursor(Qt.PointingHandCursor)
+        self.btn_camedit.setFixedSize(34, 34)
+        self.btn_camedit.setToolTip("카메라서버 IP 편집")
+        self.btn_camedit.setStyleSheet(
+            f"QToolButton{{background:{C['divider']};color:{C['neutral700']};"
+            f"border:none;border-radius:8px;font-size:14px;}}"
+            f"QToolButton:hover{{background:#d6d6d0;}}"
+            f"QToolButton:disabled{{color:#b6b6b0;}}")
+        self.btn_camedit.clicked.connect(self._toggle_camip_edit)
+        camrow.addWidget(self.ed_camip, 1)
+        camrow.addWidget(self.btn_camedit)
+        v.addLayout(camrow)
+
+        return card
+
+    def _populate_net(self):
+        self.cmb_net.clear()
+        ifaces = list_net_ifaces()
+        preferred = getattr(self.args, "net", None)
+        sel = 0
+        for i, (iface, ip) in enumerate(ifaces):
+            mark = "  ✓" if is_dds_ip(ip) else ""
+            self.cmb_net.addItem(f"{iface}  ({ip}){mark}", iface)
+            # preselect: explicit --net wins, else first DDS-subnet iface
+            if preferred and iface == preferred:
+                sel = i
+            elif not preferred and is_dds_ip(ip) and sel == 0:
+                sel = i
+        if ifaces:
+            self.cmb_net.setCurrentIndex(sel)
+        else:
+            self.cmb_net.addItem("(인터페이스 없음)", None)
+
+    def _style_camip(self, editable):
+        if editable:
+            self.ed_camip.setStyleSheet(
+                f"QLineEdit{{background:{C['card']};color:{C['text']};"
+                f"border:2px solid {C['accent']};border-radius:8px;padding:0 10px;"
+                f"font-size:12px;font-weight:600;}}")
+        else:
+            self.ed_camip.setStyleSheet(
+                f"QLineEdit{{background:{C['divider']};color:{C['neutral700']};"
+                f"border:none;border-radius:8px;padding:0 10px;"
+                f"font-size:12px;font-weight:600;}}")
+
+    def _toggle_camip_edit(self):
+        editable = self.ed_camip.isReadOnly()   # currently RO -> switch to editable
+        self.ed_camip.setReadOnly(not editable)
+        self._style_camip(editable)
+        self.btn_camedit.setText("✓" if editable else "✎")
+        if editable:
+            self.ed_camip.setFocus()
+            self.ed_camip.selectAll()
+
+    def _on_motion_changed(self):
+        # selecting 전신(이동) on a real robot -> guide operator into walking mode.
+        # informational at toggle time: cancel/continue both keep the 전신 choice
+        # (never revert to 상체, which could imply switching the robot to debug mode).
+        if self.set_motion.value() and self.args.domain == 0:
+            self._open_walk_dialog()
+
+    def _open_walk_dialog(self):
+        """Show the walking-mode gate. Returns True if [계속] pressed."""
+        dlg = WalkModeDialog(self, self.mode_checker)
+        return dlg.exec_() == QDialog.Accepted
 
     def _status_card(self):
         card = self._card()
@@ -680,6 +1041,12 @@ class Dashboard(QWidget):
         self.btn_start.setEnabled(p in ("ready", "paused"))
         self.btn_pause.setEnabled(p == "running")
         self.btn_stop.setEnabled(p != "off")
+        # settings are launch-time args -> editable only before launch
+        if hasattr(self, "settings_card"):
+            editable = (p == "off")
+            self.settings_card.setEnabled(editable)
+            if not editable and not self.ed_camip.isReadOnly():
+                self._toggle_camip_edit()  # collapse camera-ip edit on lock
 
     def _set_phase(self, phase):
         self._phase = phase
@@ -689,14 +1056,26 @@ class Dashboard(QWidget):
         if self.proc and self.proc.poll() is None:
             self._log("이미 실행 중")
             return
+        # safety gate: 전신(이동) on a real robot requires walking mode. re-verify
+        # right before launch (mode may have dropped since the toggle).
+        if self.set_motion.value() and self.args.domain == 0:
+            _, walking, _ = self.mode_checker.status()
+            if not walking:
+                if not self._open_walk_dialog():
+                    self._log("실행 취소 — 걷기 모드 미확인 (전신 제어)")
+                    return
         cmd = self._build_teleop_cmd()
         self._log("텔레옵 프로세스 실행: " + " ".join(cmd))
         try:
             import subprocess
+            env = os.environ.copy()
+            env["COLUMNS"] = "200"          # widen rich/logging_mp console -> less soft-wrap
+            env["PYTHONUNBUFFERED"] = "1"    # flush logs promptly to the pipe
             self.proc = subprocess.Popen(
                 cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=os.environ.copy())
+                text=True, bufsize=1, env=env,
+                start_new_session=True)      # own process group -> killpg on exit kills children
         except Exception as e:
             self._log(f"실행 실패: {e}")
             return
@@ -741,7 +1120,8 @@ class Dashboard(QWidget):
         self.time_lbl.setText("00:00")
         self._set_tag(False, "종료됨")
         self._log("텔레옵 종료 요청")
-        # teleop exits on its own; _poll_proc will flip phase to "off"
+        # graceful exit expected; if not gone in 8s, _poll_proc kills the group
+        self._stop_deadline = time.time() + 8.0
 
     def _tick(self):
         self._elapsed += 1
@@ -769,18 +1149,23 @@ class Dashboard(QWidget):
         a = self.args
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "teleop_hand_and_arm.py")
+        # live settings-panel values (fall back to CLI args)
+        input_mode = self.set_inputmode.value()
+        motion = self.set_motion.value()
+        net = self.cmb_net.currentData()
+        img_ip = self.ed_camip.text().strip() or a.img_server_ip
         cmd = [sys.executable, script, "--ipc",
-               "--input-mode", a.input_mode,
+               "--input-mode", input_mode,
                "--arm", a.arm,
-               "--img-server-ip", a.img_server_ip]
-        if a.motion:
+               "--img-server-ip", img_ip]
+        if motion:
             cmd.append("--motion")
         if a.domain == 1:
             cmd.append("--sim")
         if a.ee:
             cmd += ["--ee", a.ee]
-        if a.net:
-            cmd += ["--network-interface", a.net]
+        if net:
+            cmd += ["--network-interface", net]
         if a.teleop_extra:
             cmd += a.teleop_extra.split()
         return cmd
@@ -801,12 +1186,28 @@ class Dashboard(QWidget):
         if rc is not None:
             self._proc_timer.stop()
             self.proc = None
+            self._stop_deadline = None
             self._set_phase("off")
             self._sec_timer.stop()
             self._elapsed = 0
             self.time_lbl.setText("00:00")
             self._set_tag(False)
             self._log(f"텔레옵 프로세스 종료 (rc={rc})")
+            return
+        # still alive past the stop deadline -> force-kill the whole group
+        if self._stop_deadline and time.time() > self._stop_deadline:
+            self._stop_deadline = None
+            self._log("종료 지연 — 프로세스 그룹 강제 종료 (SIGTERM)")
+            self._kill_proc_group(signal.SIGTERM)
+
+    def _kill_proc_group(self, sig=signal.SIGTERM):
+        """Signal the whole teleop process group (parent + multiprocessing children)."""
+        if not self.proc:
+            return
+        try:
+            os.killpg(os.getpgid(self.proc.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            pass
 
     # --- misc ---------------------------------------------------------------
     def _resolve_model(self):
@@ -822,20 +1223,18 @@ class Dashboard(QWidget):
             self.cam.stop()
         except Exception:
             pass
-        # shut down teleop process if we launched it
+        # shut down teleop process group if we launched it
         if self.proc and self.proc.poll() is None:
             try:
                 self.ipc.send_cmd("CMD_STOP")
                 self.proc.wait(timeout=5)
             except Exception:
+                # graceful exit failed -> SIGTERM the group, then SIGKILL
                 try:
-                    self.proc.terminate()
+                    self._kill_proc_group(signal.SIGTERM)
                     self.proc.wait(timeout=3)
                 except Exception:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
+                    self._kill_proc_group(signal.SIGKILL)
         super().closeEvent(e)
 
 
@@ -855,8 +1254,8 @@ def main():
                    choices=["G1_29", "G1_23", "H1_2", "H1", "R1"])
     p.add_argument("--ee", type=str, default=None,
                    choices=["dex1", "dex3", "inspire_ftp", "inspire_dfx", "brainco"])
-    p.add_argument("--motion", action="store_true", default=True,
-                   help="pass --motion to teleop (default on)")
+    p.add_argument("--motion", action="store_true", default=False,
+                   help="default control range: 전신(이동). off => 상체(팔만, safe default)")
     p.add_argument("--no-motion", dest="motion", action="store_false")
     p.add_argument("--teleop-extra", type=str, default=None,
                    help="extra args appended to the teleop command")
