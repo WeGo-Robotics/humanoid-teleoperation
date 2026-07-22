@@ -23,12 +23,22 @@ class MotionSwitcher:
         except Exception as e:
             return None, None
     
-    def Exit_Debug_Mode(self):
+    def Exit_Debug_Mode(self, retries=10, wait=0.5):
+        # SelectMode('ai') can return 7002 right after leaving debug even when it
+        # takes effect a moment later; retry and judge success by CheckMode (not the
+        # SelectMode return code). Symmetric with Enter_Debug_Mode's release loop.
+        # Returns (ok, name): ok=True once the robot confirms 'ai' mode.
         try:
-            status, result = self.msc.SelectMode(nameOrAlias='ai')
-            return status, result
+            for _ in range(retries):
+                self.msc.SelectMode(nameOrAlias='ai')
+                time.sleep(wait)
+                _, check = self.msc.CheckMode()
+                name = check.get('name') if isinstance(check, dict) else None
+                if name == 'ai':
+                    return True, name
+            return False, None
         except Exception as e:
-            return None, None
+            return False, None
 
 class LocoClientWrapper:
     def __init__(self):

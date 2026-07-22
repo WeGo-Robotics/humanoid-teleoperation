@@ -545,8 +545,8 @@ if __name__ == '__main__':
             # regains control (remote only works in ai mode). motion(전신) mode
             # never entered debug, so nothing to restore.
             if not args.motion and motion_switcher is not None:
-                status, result = motion_switcher.Exit_Debug_Mode()
-                logger_mp.info(f"Restore ai mode: {'Success' if status == 3104 else f'status={status}'}")
+                ok, _name = motion_switcher.Exit_Debug_Mode()
+                logger_mp.info(f"Restore ai mode: {'Success' if ok else 'Failed'}")
         except Exception as e:
             logger_mp.error(f"Failed to restore ai mode: {e}")
 
