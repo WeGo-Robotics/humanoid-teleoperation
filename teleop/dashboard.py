@@ -352,6 +352,8 @@ class MujocoWorker(QObject):
             data = mj.MjData(model)
             data.qpos[2] = STAND_Z
             data.qpos[3] = 1.0             # quat w = 1
+            # robot geoms only (exclude worldbody floor) for floor-grounding
+            robot_geom = np.asarray(model.geom_bodyid) > 0
             mj.mj_forward(model, data)
             cur_w, cur_h = self._target_w, self._target_h
             renderer = mj.Renderer(model, height=cur_h, width=cur_w)
@@ -379,7 +381,15 @@ class MujocoWorker(QObject):
                 if q is not None:
                     n = min(G1_NUM_MOTOR, len(q))
                     data.qpos[QPOS_OFFSET:QPOS_OFFSET + n] = q[:n]
+                # the real robot's lowstate has no floating-base height, so pin the
+                # pelvis then drop the model until its lowest geom rests on the floor.
+                # keeps feet grounded for any leg pose (STAND_Z alone floats/sinks).
+                data.qpos[2] = STAND_Z
                 mj.mj_forward(model, data)
+                zmin = float(data.geom_xpos[robot_geom, 2].min())
+                if abs(zmin) > 1e-4:
+                    data.qpos[2] -= zmin
+                    mj.mj_forward(model, data)
 
                 cam.type = mj.mjtCamera.mjCAMERA_FREE
                 cam.azimuth = self.cam_azimuth
