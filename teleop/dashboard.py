@@ -157,11 +157,31 @@ class Segmented(QWidget):
             self._restyle()
 
 
+class ClickRow(QFrame):
+    """A clickable row (used as an accordion header)."""
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+
 class MotionModeChecker:
     """Query the robot's motion-service mode via MotionSwitcherClient.CheckMode().
     Walking/Regular mode => result['name'] is non-empty. Debug mode => ''."""
+    # G1 loco FSM ids (verified on the real robot)
+    FSM_ZERO_TORQUE = 0
+    FSM_DAMP = 1
+    FSM_SIT = 3
+    FSM_STAND = 4
+    FSM_WALK = 501
+    FSM_RUN = 802
+    GET_FSM_ID_API = 7001
+
     def __init__(self):
         self._msc = None
+        self._loco = None
 
     def _client(self):
         if self._msc is None:
@@ -172,6 +192,15 @@ class MotionModeChecker:
             c.Init()
             self._msc = c
         return self._msc
+
+    def _loco_client(self):
+        if self._loco is None:
+            from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+            c = LocoClient()
+            c.SetTimeout(0.4)
+            c.Init()
+            self._loco = c
+        return self._loco
 
     # motion-service mode name that means the robot is in walking (Regular) mode
     WALK_MODE = "ai"
@@ -187,6 +216,18 @@ class MotionModeChecker:
             return True, name == self.WALK_MODE, name
         except Exception:
             return False, False, None
+
+    def fsm_id(self):
+        """Return (ok, fsm_id). ok=False => could not query (e.g. debug mode, the
+        loco service is off and the call times out)."""
+        try:
+            code, data = self._loco_client()._Call(self.GET_FSM_ID_API, "")
+            if code != 0 or not data:
+                return False, None
+            import json
+            return True, int(json.loads(data).get("data"))
+        except Exception:
+            return False, None
 
 
 class WalkModeDialog(QDialog):
@@ -230,17 +271,40 @@ class WalkModeDialog(QDialog):
         cv.addWidget(title)
 
         body = QLabel("전신(이동) 제어는 로봇이 <b>걷기 모드</b>일 때만 동작합니다.<br>"
-                      "리모컨으로 <b>R1 + X</b> 를 눌러 걷기 모드로 전환하세요.")
+                      "아래 순서대로 리모컨으로 모드를 올려 주세요.")
         body.setWordWrap(True)
         body.setAlignment(Qt.AlignCenter)
         body.setStyleSheet(
             f"font-size:13px;line-height:1.5;color:{C['neutral700']};")
         cv.addWidget(body)
 
-        # live status pill
-        self._status = QLabel()
-        self._status.setAlignment(Qt.AlignCenter)
-        cv.addWidget(self._status)
+        # FSM step list: highlights the robot's current stage on the way to walking
+        self.STEPS = [
+            (MotionModeChecker.FSM_ZERO_TORQUE, "제로토크"),
+            (MotionModeChecker.FSM_DAMP, "댐핑"),
+            (MotionModeChecker.FSM_STAND, "서기"),
+            (MotionModeChecker.FSM_WALK, "걷기"),
+        ]
+        steps = QFrame()
+        steps.setStyleSheet(f"QFrame{{background:{C['bg']};border-radius:10px;}}")
+        sv = QVBoxLayout(steps)
+        sv.setContentsMargins(16, 12, 16, 12)
+        sv.setSpacing(8)
+        self._step_labels = {}
+        for i, (fid, name) in enumerate(self.STEPS):
+            row = QLabel()
+            row.setStyleSheet("font-size:13px;")
+            sv.addWidget(row)
+            self._step_labels[fid] = row
+        cv.addWidget(steps)
+
+        # off-sequence / unknown-state hint
+        self._hint = QLabel()
+        self._hint.setWordWrap(True)
+        self._hint.setAlignment(Qt.AlignCenter)
+        self._hint.setStyleSheet("font-size:12px;font-weight:600;color:#d64545;")
+        self._hint.setVisible(False)
+        cv.addWidget(self._hint)
 
         cv.addSpacing(4)
         brow = QHBoxLayout()
@@ -272,27 +336,154 @@ class WalkModeDialog(QDialog):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
-        self._set_status(None)
+        self._render_steps(None)
 
-    def _set_status(self, walking):
-        # walking: True(green) / False(gray, waiting) / None(red, unknown)
-        if walking is True:
-            dot, txt, col = "●", "걷기 모드 확인됨", "#1f9d55"
-        elif walking is False:
-            dot, txt, col = "●", "걷기 모드 대기 중…", C["neutral700"]
-        else:
-            dot, txt, col = "●", "로봇 상태 확인 불가", "#d64545"
-        self._status.setText(f'<span style="color:{col}">{dot}</span>'
-                             f'<span style="color:{col};font-weight:600">&nbsp;{txt}</span>')
+    def _render_steps(self, current):
+        # highlight only the step matching the robot's current fsm id
+        for fid, name in self.STEPS:
+            active = (fid == current)
+            col = "#1f9d55" if active else "#b6b6b0"
+            weight = 700 if active else 500
+            check = "●" if active else "○"
+            self._step_labels[fid].setText(
+                f'<span style="color:{col}">{check}</span>'
+                f'<span style="color:{col};font-weight:{weight}">&nbsp;&nbsp;{name}</span>')
 
     def _poll(self):
-        ok, walking, _name = self._checker.status()
-        if not ok:
-            self._set_status(None)
+        ok, fid = self._checker.fsm_id()
+        step_ids = [s[0] for s in self.STEPS]
+        if not ok or fid is None:
+            # loco service off (e.g. debug mode) or query failed
+            self._render_steps(None)
+            self._hint.setText("로봇 상태 확인 불가 — 리모컨으로 모드를 켜 주세요")
+            self._hint.setVisible(True)
             self._btn_ok.setEnabled(False)
+        elif fid in step_ids:
+            self._render_steps(fid)
+            self._hint.setVisible(False)
+            self._btn_ok.setEnabled(fid == MotionModeChecker.FSM_WALK)
         else:
-            self._set_status(walking)
-            self._btn_ok.setEnabled(walking)
+            # off the zero-torque -> damp -> stand -> walk path (e.g. sit, run)
+            self._render_steps(None)
+            other = {MotionModeChecker.FSM_SIT: "앉기",
+                     MotionModeChecker.FSM_RUN: "러닝"}.get(fid, f"기타(id {fid})")
+            self._hint.setText(f"현재 '{other}' 상태 — 걷기 순서를 벗어남. 걷기 모드로 맞춰 주세요")
+            self._hint.setVisible(True)
+            self._btn_ok.setEnabled(False)
+
+    def showEvent(self, e):
+        p = self.parent()
+        if p is not None:
+            tl = p.mapToGlobal(p.rect().topLeft())
+            self.setGeometry(tl.x(), tl.y(), p.width(), p.height())
+        self._poll()
+        self._timer.start(500)
+        super().showEvent(e)
+
+    def hideEvent(self, e):
+        self._timer.stop()
+        super().hideEvent(e)
+
+
+# fsm id -> human label
+FSM_NAMES = {0: "제로토크", 1: "댐핑", 3: "앉기", 4: "서기", 501: "걷기", 802: "러닝"}
+# states where the robot bears its own weight -> entering debug drops it
+FSM_WEIGHT_BEARING = {4, 501, 802}
+
+
+class DebugWarnDialog(QDialog):
+    """Modal shown before launching 상체(debug) control: warns that entering debug
+    mode releases the legs (fall risk). Acknowledgement only ([확인] always on);
+    severity is raised live when the robot is currently weight-bearing."""
+    def __init__(self, parent, checker):
+        super().__init__(parent)
+        self._checker = checker
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        dim = QWidget()
+        dim.setStyleSheet("background:rgba(20,20,22,0.48);")
+        outer.addWidget(dim)
+        dl = QVBoxLayout(dim)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.addStretch(1)
+        crow = QHBoxLayout()
+        crow.addStretch(1)
+
+        card = QFrame()
+        card.setFixedWidth(380)
+        card.setStyleSheet(f"QFrame{{background:{C['card']};border-radius:16px;}}")
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(28, 28, 28, 24)
+        cv.setSpacing(14)
+
+        icon = QLabel("⚠️")
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setStyleSheet("font-size:40px;")
+        cv.addWidget(icon)
+
+        title = QLabel("디버그 모드 — 하체 힘 풀림")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"font-size:17px;font-weight:700;color:{C['text']};")
+        cv.addWidget(title)
+
+        body = QLabel("상체(팔만) 제어는 <b>디버그 모드</b>로 진입해 다리 힘이 풀립니다.<br>"
+                      "로봇이 주저앉을 수 있으니 지지 상태를 확인 후 진행하세요.")
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignCenter)
+        body.setStyleSheet(f"font-size:13px;line-height:1.5;color:{C['neutral700']};")
+        cv.addWidget(body)
+
+        # live severity line (depends on current fsm)
+        self._sev = QLabel()
+        self._sev.setWordWrap(True)
+        self._sev.setAlignment(Qt.AlignCenter)
+        self._sev.setStyleSheet("font-size:12px;font-weight:700;")
+        cv.addWidget(self._sev)
+
+        cv.addSpacing(4)
+        brow = QHBoxLayout()
+        brow.setSpacing(10)
+        btn_cancel = QPushButton("취소")
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        btn_cancel.setFixedHeight(40)
+        btn_cancel.setStyleSheet(
+            f"QPushButton{{background:{C['divider']};color:{C['text']};border:none;"
+            f"border-radius:8px;font-size:13px;font-weight:600;}}")
+        btn_ok = QPushButton("확인, 진행")
+        btn_ok.setCursor(Qt.PointingHandCursor)
+        btn_ok.setFixedHeight(40)
+        btn_ok.setStyleSheet(
+            f"QPushButton{{background:{C['accent']};color:#fff;border:none;"
+            f"border-radius:8px;font-size:13px;font-weight:700;}}")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok.clicked.connect(self.accept)
+        brow.addWidget(btn_cancel, 1)
+        brow.addWidget(btn_ok, 1)
+        cv.addLayout(brow)
+
+        crow.addWidget(card)
+        crow.addStretch(1)
+        dl.addLayout(crow)
+        dl.addStretch(1)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+
+    def _poll(self):
+        ok, fid = self._checker.fsm_id()
+        if ok and fid in FSM_WEIGHT_BEARING:
+            self._sev.setStyleSheet("font-size:12px;font-weight:700;color:#d64545;")
+            self._sev.setText(f"⚠️ 현재 '{FSM_NAMES.get(fid, fid)}' — 진입 즉시 주저앉습니다!")
+        elif ok and fid is not None:
+            self._sev.setStyleSheet("font-size:12px;font-weight:700;color:#1f9d55;")
+            self._sev.setText(f"현재 '{FSM_NAMES.get(fid, fid)}' — 지지 상태, 비교적 안전")
+        else:
+            self._sev.setStyleSheet(f"font-size:12px;font-weight:700;color:{C['neutral700']};")
+            self._sev.setText("로봇 상태 확인 불가 — 지지 상태를 직접 확인하세요")
 
     def showEvent(self, e):
         p = self.parent()
@@ -829,14 +1020,40 @@ class Dashboard(QWidget):
     def _settings_card(self):
         card = self._card()
         self.settings_card = card
-        v = QVBoxLayout(card)
-        v.setContentsMargins(20, 20, 20, 20)
-        v.setSpacing(14)
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        kicker = QLabel("설정")
-        kicker.setStyleSheet(
+        # --- clickable accordion header (collapsed by default) ---
+        header = ClickRow()
+        header.setCursor(Qt.PointingHandCursor)
+        # transparent so it shows the parent card's white bg instead of drawing
+        # its own rounded box (which would inherit the QFrame card style)
+        header.setStyleSheet("QFrame{background:transparent;border:none;border-radius:0px;}")
+        header.clicked.connect(self._toggle_settings)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(20, 16, 20, 16)
+        htitle = QLabel("⚙  설정")
+        htitle.setStyleSheet(
             f"font-size:11px;font-weight:700;letter-spacing:.08em;color:{C['neutral700']};")
-        v.addWidget(kicker)
+        self._settings_chevron = QLabel("▸")
+        self._settings_chevron.setStyleSheet(f"font-size:11px;color:{C['neutral700']};")
+        hl.addWidget(htitle)
+        hl.addStretch(1)
+        hl.addWidget(self._settings_chevron)
+        outer.addWidget(header)
+
+        # --- collapsible body ---
+        self.settings_body = QWidget()
+        # transparent (scoped) so the parent card's white bg shows through; a plain
+        # child QWidget otherwise paints the page gray over the card area
+        self.settings_body.setObjectName("settingsBody")
+        self.settings_body.setStyleSheet("QWidget#settingsBody{background:transparent;}")
+        self.settings_body.setVisible(False)   # hidden by default
+        v = QVBoxLayout(self.settings_body)
+        v.setContentsMargins(20, 0, 20, 20)
+        v.setSpacing(14)
+        outer.addWidget(self.settings_body)
 
         # 1) VR입력 : --input-mode  (controller | hand)
         v.addWidget(self._caption("VR입력"))
@@ -932,6 +1149,11 @@ class Dashboard(QWidget):
             self.ed_camip.setFocus()
             self.ed_camip.selectAll()
 
+    def _toggle_settings(self):
+        show = not self.settings_body.isVisible()
+        self.settings_body.setVisible(show)
+        self._settings_chevron.setText("▾" if show else "▸")
+
     def _on_motion_changed(self):
         # selecting 전신(이동) on a real robot -> guide operator into walking mode.
         # informational at toggle time: cancel/continue both keep the 전신 choice
@@ -942,6 +1164,11 @@ class Dashboard(QWidget):
     def _open_walk_dialog(self):
         """Show the walking-mode gate. Returns True if [계속] pressed."""
         dlg = WalkModeDialog(self, self.mode_checker)
+        return dlg.exec_() == QDialog.Accepted
+
+    def _open_debug_warn_dialog(self):
+        """Show the debug-mode fall-risk warning. Returns True if [확인] pressed."""
+        dlg = DebugWarnDialog(self, self.mode_checker)
         return dlg.exec_() == QDialog.Accepted
 
     def _status_card(self):
@@ -1055,10 +1282,11 @@ class Dashboard(QWidget):
         self.btn_start.setEnabled(p in ("ready", "paused"))
         self.btn_pause.setEnabled(p == "running")
         self.btn_stop.setEnabled(p != "off")
-        # settings are launch-time args -> editable only before launch
-        if hasattr(self, "settings_card"):
+        # settings are launch-time args -> body editable only before launch.
+        # header stays clickable so the panel can still be expanded to view them.
+        if hasattr(self, "settings_body"):
             editable = (p == "off")
-            self.settings_card.setEnabled(editable)
+            self.settings_body.setEnabled(editable)
             if not editable and not self.ed_camip.isReadOnly():
                 self._toggle_camip_edit()  # collapse camera-ip edit on lock
 
@@ -1070,13 +1298,19 @@ class Dashboard(QWidget):
         if self.proc and self.proc.poll() is None:
             self._log("이미 실행 중")
             return
-        # safety gate: 전신(이동) on a real robot requires walking mode. re-verify
-        # right before launch (mode may have dropped since the toggle).
-        if self.set_motion.value() and self.args.domain == 0:
-            _, walking, _ = self.mode_checker.status()
-            if not walking:
-                if not self._open_walk_dialog():
-                    self._log("실행 취소 — 걷기 모드 미확인 (전신 제어)")
+        # safety gates on the real robot, evaluated right before launch
+        if self.args.domain == 0:
+            if self.set_motion.value():
+                # 전신(이동): requires walking mode (re-verify; may have dropped)
+                ok, fid = self.mode_checker.fsm_id()
+                if not (ok and fid == MotionModeChecker.FSM_WALK):
+                    if not self._open_walk_dialog():
+                        self._log("실행 취소 — 걷기 모드 미확인 (전신 제어)")
+                        return
+            else:
+                # 상체(팔만): entering debug mode releases the legs -> fall warning
+                if not self._open_debug_warn_dialog():
+                    self._log("실행 취소 — 디버그 경고 미확인 (상체 제어)")
                     return
         cmd = self._build_teleop_cmd()
         self._log("텔레옵 프로세스 실행: " + " ".join(cmd))
