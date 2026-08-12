@@ -572,6 +572,10 @@ class MujocoWorker(QObject):
                 if q is not None:
                     n = min(G1_NUM_MOTOR, len(q))
                     data.qpos[QPOS_OFFSET:QPOS_OFFSET + n] = q[:n]
+                # tilt the pelvis to match the real robot's IMU orientation
+                quat = self._src.get_pelvis_quat()
+                if quat is not None and np.linalg.norm(quat) > 1e-6:
+                    data.qpos[3:7] = quat / np.linalg.norm(quat)
                 # the real robot's lowstate has no floating-base height, so pin the
                 # pelvis then drop the model until its lowest geom rests on the floor.
                 # keeps feet grounded for any leg pose (STAND_Z alone floats/sinks).
@@ -610,6 +614,7 @@ class MujocoWorker(QObject):
 class LowStateSource:
     def __init__(self):
         self._q = None
+        self._quat = None                  # pelvis IMU orientation [w,x,y,z]
         self._lock = threading.Lock()
         self._ok = False
 
@@ -629,14 +634,20 @@ class LowStateSource:
     def _on_msg(self, msg):
         try:
             q = np.array([msg.motor_state[i].q for i in range(G1_NUM_MOTOR)])
+            quat = np.array(msg.imu_state.quaternion, dtype=float)   # [w,x,y,z]
             with self._lock:
                 self._q = q
+                self._quat = quat
         except Exception:
             pass
 
     def get_motor_q(self):
         with self._lock:
             return None if self._q is None else self._q.copy()
+
+    def get_pelvis_quat(self):
+        with self._lock:
+            return None if self._quat is None else self._quat.copy()
 
 
 # ----------------------------------------------------------------------------
@@ -843,9 +854,9 @@ class Stage(QWidget):
     def __init__(self):
         super().__init__()
         self.setStyleSheet(f"background:{C['neutral900']};")
-        self.sim = VideoLabel("무조코 시뮬레이션 화면", self)
+        self.sim = VideoLabel("시뮬레이션 화면", self)
         self.cam = VideoLabel("로봇 카메라 시점", self)
-        self.sim_label = self._badge("무조코 시뮬레이션")
+        self.sim_label = self._badge("시뮬레이션")
         self.cam_label = self._badge("카메라 뷰")
         self.main_view = "sim"
         self._mj = None                 # MujocoWorker, set via set_mujoco()
