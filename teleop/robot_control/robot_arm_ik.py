@@ -15,7 +15,13 @@ sys.path.append(parent2_dir)
 
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
-class G1_29_ArmIK:
+try:
+    from teleop.robot_control.arm_fk import ArmFKMixin
+except ImportError:  # when this file is run directly as a script
+    from arm_fk import ArmFKMixin
+
+
+class G1_29_ArmIK(ArmFKMixin):
     def __init__(self, Unit_Test = False, Visualization = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
@@ -309,7 +315,7 @@ class G1_29_ArmIK:
             # return sol_q, sol_tauff
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
         
-class G1_23_ArmIK:
+class G1_23_ArmIK(ArmFKMixin):
     def __init__(self, Unit_Test = False, Visualization = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
@@ -589,7 +595,7 @@ class G1_23_ArmIK:
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
 
 
-class H1_2_ArmIK:
+class H1_2_ArmIK(ArmFKMixin):
     def __init__(self, Unit_Test = False, Visualization = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
@@ -892,7 +898,7 @@ class H1_2_ArmIK:
             # return sol_q, sol_tauff
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
 
-class H1_ArmIK:
+class H1_ArmIK(ArmFKMixin):
     def __init__(self, Unit_Test = False, Visualization = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
@@ -1199,7 +1205,7 @@ class H1_ArmIK:
             # return sol_q, sol_tauff
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
 
-class R1_ArmIK:
+class R1_ArmIK(ArmFKMixin):
     """
     Dual-arm inverse kinematics for the Unitree R1 humanoid (5 DOF per arm, 10 total).
     Arm joint order (matches R1_ArmController.R1_JointArmIndex and the URDF):
