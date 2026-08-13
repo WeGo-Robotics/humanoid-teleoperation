@@ -4,14 +4,11 @@ An asyncio `websockets` server on its own daemon thread, so the 30 Hz control
 loop never awaits anything. The loop reads a lock-protected snapshot; the server
 thread writes it.
 
-**Pose convention on the wire.** The device sends poses already in the robot
-convention (z up, y left, x front) with wrists in the IK target frame -- i.e.
-the same values `tv_wrapper.get_tele_data()` produces, not raw OpenXR. This
-keeps the host from needing a per-runtime transform table, at the cost of each
-device implementing the convention itself. The alternative (raw OpenXR on the
-wire, one transform on the host) keeps the safety-relevant geometry in a single
-place and is worth revisiting before the app team starts -- see the note in
-docs/xr_automation_and_safety_plan.md §11.
+**Pose convention on the wire.** Protocol v2 carries *raw OpenXR* poses (y up,
+z back, x right) exactly as the device's XR nodes report them. The whole
+OpenXR->robot chain runs on the host in `transforms.py`, so the safety-relevant
+geometry exists in one reviewed implementation rather than one per client. This
+server does not transform anything; `NativeXRSource` does, on the way out.
 
 Single operator by design: a second connection **supersedes** the first rather
 than being rejected, for the same reason Vuer sessions do. A headset that
@@ -24,11 +21,12 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
-from .codec import CodecError, TrackingFrame, decode_control, decode_tracking, encode_control
+from .codec import (BUTTON_NAMES, CodecError, TrackingFrame, decode_control,
+                    decode_tracking, encode_control)
 
 try:
     import logging_mp
@@ -51,6 +49,11 @@ class LinkSnapshot:
     battery: Optional[float] = None
     device: str = ""
     estop_requested: bool = False
+    #: Currently-held buttons, from the control channel. Level-triggered, not
+    #: edge-triggered: the device re-sends the full held set whenever it
+    #: changes, so a dropped message self-corrects on the next press or
+    #: release instead of leaving a button stuck down forever.
+    buttons: Tuple[str, ...] = ()
 
 
 class XrLinkServer:
@@ -164,7 +167,13 @@ class XrLinkServer:
                 # session_up goes false immediately. The safety layer treats
                 # that as terminal, which is the whole point.
                 with self._lock:
-                    self._snap = replace(self._snap, connected=False, worn=None)
+                    # Buttons are level-triggered, so a set held at the moment
+                    # the link dropped would otherwise stay held forever. The
+                    # safety layer stops the robot on disconnect regardless;
+                    # this just refuses to keep a stale press around for
+                    # whatever reconnects next.
+                    self._snap = replace(self._snap, connected=False, worn=None,
+                                         buttons=())
 
     def _on_message(self, message):
         if isinstance(message, (bytes, bytearray)):
@@ -204,6 +213,7 @@ class XrLinkServer:
             return
 
         kind = msg.get("t")
+        unknown: Tuple[str, ...] = ()
         with self._lock:
             if kind == "hello":
                 self._snap = replace(self._snap, device=str(msg.get("dev", "")))
@@ -211,6 +221,14 @@ class XrLinkServer:
                                f"proto={msg.get('proto')}")
             elif kind == "presence":
                 self._snap = replace(self._snap, worn=bool(msg.get("worn")))
+            elif kind == "buttons":
+                pressed = msg.get("pressed") or ()
+                if not isinstance(pressed, (list, tuple)):
+                    unknown, pressed = (), ()
+                else:
+                    unknown = tuple(b for b in pressed if b not in BUTTON_NAMES)
+                    pressed = tuple(b for b in pressed if b in BUTTON_NAMES)
+                self._snap = replace(self._snap, buttons=pressed)
             elif kind == "status":
                 battery = msg.get("battery")
                 self._snap = replace(
@@ -218,6 +236,12 @@ class XrLinkServer:
                     battery=float(battery) if battery is not None else None)
             elif kind == "estop":
                 self._snap = replace(self._snap, estop_requested=True)
+
+        if unknown:
+            # Not fatal -- the known buttons in the same message were kept -- but
+            # it means the app and the host disagree about the vocabulary, and
+            # some control the operator is pressing is doing nothing.
+            logger_mp.warning(f"[XrLink] ignoring unknown buttons: {unknown}")
 
         if kind == "estop":
             logger_mp.error("[XrLink] device requested EMERGENCY STOP")

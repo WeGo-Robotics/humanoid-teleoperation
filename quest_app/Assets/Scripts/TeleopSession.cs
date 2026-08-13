@@ -1,7 +1,7 @@
-// The Quest app's session behaviour: presence, tracking, and host state.
+// The Quest app's session behaviour: presence, tracking, buttons, host state.
 //
 // Attach to one GameObject in the scene. Everything safety-relevant is here;
-// the UI is expected to read SessionState/AlignReason and render them, and
+// the UI is expected to read the public read-only fields and render them, and
 // nothing else.
 //
 // Three things in this file are easy to get wrong and expensive to debug on
@@ -14,11 +14,12 @@
 //     that frame. The OS may suspend us immediately afterwards.
 //  3. NO LOCAL SAFETY LOGIC. This app reports; it does not decide. The host
 //     owns every stop decision. Do not add "helpful" client-side gating -- two
-//     half-implementations of a safety rule is worse than one.
+//     half-implementations of a safety rule is worse than one. The estop below
+//     is not an exception: it *requests* a stop, it does not perform one.
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
-using System.Threading.Tasks;
 using UnityEngine;
 
 namespace WeGo.Teleop
@@ -28,36 +29,61 @@ namespace WeGo.Teleop
         [Header("Host")]
         public string HostAddress = "192.168.123.2";
         public int Port = 8443;
-        public bool UseTls = true;
+        public bool UseTls = false;   // see the TLS note in docs section 12.7
 
         [Header("Input")]
-        public bool HandTracking = false;   // controllers first; see docs §12
+        public bool HandTracking = false;   // controllers first; see docs 12.2
+
+        [Header("Scene")]
+        [Tooltip("Centre-eye anchor. Falls back to Camera.main when unset.")]
+        public Transform HeadTransform;
 
         [Header("Read-only state for the UI")]
         public string SessionState = "DISCONNECTED";
         public string AlignReason = "";
         public float AlignProgress;
         public bool IsWorn;
+        public bool LinkConnected;
+        public int SkippedFrames;
+        public string HostUrl = "";
+
+        /// <summary>Both secondary face buttons (Y on the left controller, B on
+        /// the right). Chosen because it is symmetric, reachable without
+        /// looking, and not bound to anything else -- A/X already quit the
+        /// session and the thumbstick clicks already damp the robot.</summary>
+        private const string EstopBinding = "Y + B";
+        public string EstopHint => $"{EstopBinding}  =  EMERGENCY STOP";
+
+        private const float ButtonResendInterval = 0.1f;
 
         private XrLinkClient _link;
         private CancellationTokenSource _cts;
-        private Transform _head, _leftHand, _rightHand;
+
+        private readonly List<string> _pressed = new List<string>(6);
+        private string _lastButtonKey = null;
+        private float _lastButtonSend;
+        private bool _estopLatched;
 
         // ------------------------------------------------------------------
         // lifecycle
         // ------------------------------------------------------------------
         private void Awake()
         {
-            if (!BitConverter.IsLittleEndian)
-                Debug.LogError("[Teleop] big-endian host: the wire format is " +
-                               "little-endian and will be misread by the host.");
+            if (HandTracking)
+            {
+                // The 26->25 joint mapping is not implemented (docs 12.2). With
+                // the flag on we would send all-zero joints, which the host
+                // would retarget into a real finger pose. Refuse rather than
+                // send something that looks like data.
+                Debug.LogError("[Teleop] hand tracking is not implemented in " +
+                               "this build; falling back to controllers.");
+                HandTracking = false;
+            }
 
             // Keep running when the headset is doffed, so HMDUnmounted has a
             // chance to transmit. Also see the Android manifest notes in the
             // runbook -- this flag alone is not always sufficient.
             Application.runInBackground = true;
-
-            _head = Camera.main != null ? Camera.main.transform : transform;
         }
 
         private void OnEnable()
@@ -65,8 +91,8 @@ namespace WeGo.Teleop
             OVRManager.HMDMounted += HandleMounted;
             OVRManager.HMDUnmounted += HandleUnmounted;
 
-            var scheme = UseTls ? "wss" : "ws";
-            _link = new XrLinkClient($"{scheme}://{HostAddress}:{Port}");
+            HostUrl = $"{(UseTls ? "wss" : "ws")}://{HostAddress}:{Port}";
+            _link = new XrLinkClient(HostUrl);
             _cts = new CancellationTokenSource();
             _ = _link.RunAsync(_cts.Token);
         }
@@ -111,24 +137,88 @@ namespace WeGo.Teleop
         {
             DrainHostMessages();
 
-            if (_link == null || !_link.IsConnected)
+            LinkConnected = _link != null && _link.IsConnected;
+            SkippedFrames = _link?.SkippedFrames ?? 0;
+            if (!LinkConnected)
             {
                 SessionState = "DISCONNECTED";
                 return;
             }
+
+            PollEstop();
+            PollButtons();
             _ = _link.SendTrackingAsync(BuildSample());
+        }
+
+        /// <summary>Edge-triggered and latched until release, so holding the
+        /// binding sends one request rather than one per frame. The host
+        /// decides what a stop means; this only asks.</summary>
+        private void PollEstop()
+        {
+            var held = OVRInput.Get(OVRInput.Button.Two, OVRInput.Controller.LTouch) &&
+                       OVRInput.Get(OVRInput.Button.Two, OVRInput.Controller.RTouch);
+            if (held && !_estopLatched)
+            {
+                _estopLatched = true;
+                _link.SendEstop();
+                SessionState = "ESTOP REQUESTED";
+                Debug.LogWarning("[Teleop] operator requested emergency stop");
+            }
+            else if (!held)
+            {
+                _estopLatched = false;
+            }
+        }
+
+        /// <summary>Sends on change and then at ButtonResendInterval while
+        /// anything is held. The host's set is replaced wholesale by each
+        /// message, so the repeat is what makes a dropped message harmless --
+        /// it matters because two of these buttons stop the robot.</summary>
+        private void PollButtons()
+        {
+            _pressed.Clear();
+            Collect(OVRInput.Button.One, OVRInput.Controller.LTouch, "left_a");
+            Collect(OVRInput.Button.One, OVRInput.Controller.RTouch, "right_a");
+            Collect(OVRInput.Button.Two, OVRInput.Controller.LTouch, "left_b");
+            Collect(OVRInput.Button.Two, OVRInput.Controller.RTouch, "right_b");
+            Collect(OVRInput.Button.PrimaryThumbstick, OVRInput.Controller.LTouch,
+                    "left_thumb");
+            Collect(OVRInput.Button.PrimaryThumbstick, OVRInput.Controller.RTouch,
+                    "right_thumb");
+
+            var key = string.Join(",", _pressed);
+            var due = Time.unscaledTime - _lastButtonSend >= ButtonResendInterval;
+            if (key == _lastButtonKey && !(due && _pressed.Count > 0)) return;
+
+            _lastButtonKey = key;
+            _lastButtonSend = Time.unscaledTime;
+            _link.SendButtons(_pressed);
+        }
+
+        private void Collect(OVRInput.Button button, OVRInput.Controller controller,
+                             string name)
+        {
+            if (OVRInput.Get(button, controller)) _pressed.Add(name);
         }
 
         private TrackingSample BuildSample()
         {
-            IsWorn = OVRManager.isUserPresent;
+            // Instance property, and the instance can be null before the rig
+            // finishes waking. Absent evidence of presence is reported as
+            // absence, never as presence -- the host latches on worn=false,
+            // which is the safe direction to be wrong in.
+            var ovr = OVRManager.instance;
+            IsWorn = ovr != null && ovr.isUserPresent;
 
             var leftOk = OVRInput.IsControllerConnected(OVRInput.Controller.LTouch);
             var rightOk = OVRInput.IsControllerConnected(OVRInput.Controller.RTouch);
 
+            var head = Head();
+            var headPose = head != null
+                ? Matrix4x4.TRS(head.position, head.rotation, Vector3.one)
+                : Matrix4x4.identity;
             var leftPose = PoseOf(OVRInput.Controller.LTouch);
             var rightPose = PoseOf(OVRInput.Controller.RTouch);
-            var headPose = Matrix4x4.TRS(_head.position, _head.rotation, Vector3.one);
 
             // Analog inputs follow the host's inverted convention: 10.0 fully
             // open, 0.0 fully pressed. Matching it here means the gripper code
@@ -158,6 +248,17 @@ namespace WeGo.Teleop
                 RightThumb = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick,
                                           OVRInput.Controller.RTouch),
             };
+        }
+
+        /// <summary>Resolved lazily: Camera.main is null during Awake if the
+        /// camera rig has not spawned yet, and a head pose stuck at the origin
+        /// reads to the host as a perfectly still operator rather than a
+        /// missing one.</summary>
+        private Transform Head()
+        {
+            if (HeadTransform != null) return HeadTransform;
+            if (Camera.main != null) HeadTransform = Camera.main.transform;
+            return HeadTransform;
         }
 
         private static Matrix4x4 PoseOf(OVRInput.Controller c)
@@ -203,6 +304,7 @@ namespace WeGo.Teleop
                         case "abort":
                             SessionState = "ABORTED";
                             AlignReason = msg.reason ?? "";
+                            AlignProgress = 0f;
                             break;
                     }
                 }

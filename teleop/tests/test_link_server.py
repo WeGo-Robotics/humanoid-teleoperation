@@ -285,5 +285,70 @@ class TestControlChannel(LinkFixture):
         self.assertFalse(self.source.send({"t": "presence", "worn": True}))
 
 
+class TestButtons(LinkFixture):
+    """Buttons ride the control channel, but two of them stop the robot:
+    right_a quits the session and both thumbstick clicks damp the base."""
+
+    def armed_device(self):
+        d = self.device()
+        d.send_bytes(tracking(seq=1))
+        self.assertTrue(wait_until(lambda: self.source.read().liveness.seq == 1))
+        return d
+
+    def test_pressed_buttons_reach_the_control_loop(self):
+        d = self.armed_device()
+        d.send_json(t="buttons", pressed=["right_a", "left_thumb"])
+        self.assertTrue(wait_until(lambda: self.source.read().right_ctrl_aButton))
+
+        frame = self.source.read()
+        self.assertTrue(frame.left_ctrl_thumbstick)
+        self.assertFalse(frame.right_ctrl_thumbstick)
+        self.assertFalse(frame.left_ctrl_aButton)
+
+    def test_release_clears_them(self):
+        """Level-triggered: an empty set is how the device says 'released'."""
+        d = self.armed_device()
+        d.send_json(t="buttons", pressed=["right_a"])
+        self.assertTrue(wait_until(lambda: self.source.read().right_ctrl_aButton))
+        d.send_json(t="buttons", pressed=[])
+        self.assertTrue(wait_until(
+            lambda: not self.source.read().right_ctrl_aButton))
+
+    def test_unknown_names_are_dropped_but_known_ones_survive(self):
+        d = self.armed_device()
+        d.send_json(t="buttons", pressed=["right_a", "left_grip", "menu"])
+        self.assertTrue(wait_until(lambda: self.source.read().right_ctrl_aButton))
+        self.assertEqual(self.server.snapshot().buttons, ("right_a",))
+
+    def test_a_malformed_pressed_field_clears_rather_than_crashes(self):
+        d = self.armed_device()
+        d.send_json(t="buttons", pressed=["right_a"])
+        self.assertTrue(wait_until(lambda: self.source.read().right_ctrl_aButton))
+        d.send_json(t="buttons", pressed="right_a")     # a string, not a list
+        self.assertTrue(wait_until(
+            lambda: not self.source.read().right_ctrl_aButton))
+        self.assertTrue(self.source.read().liveness.session_up)
+
+    def test_disconnect_does_not_leave_a_button_held(self):
+        d = self.armed_device()
+        d.send_json(t="buttons", pressed=["left_thumb", "right_thumb"])
+        self.assertTrue(wait_until(lambda: self.source.read().left_ctrl_thumbstick))
+        d.close()
+        self.assertTrue(wait_until(
+            lambda: not self.source.read().liveness.session_up))
+        self.assertEqual(self.server.snapshot().buttons, ())
+
+    def test_buttons_before_any_pose_are_harmless(self):
+        d = self.device()
+        d.send_json(t="buttons", pressed=["right_a"])
+        self.assertTrue(wait_until(
+            lambda: self.server.snapshot().buttons == ("right_a",)))
+        # No tracking frame yet, so there is nothing to act on and the frame
+        # reports untracked rather than a press against identity poses.
+        frame = self.source.read()
+        self.assertFalse(frame.right_ctrl_aButton)
+        self.assertFalse(frame.liveness.left_tracked)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -96,9 +96,11 @@ class TrackingFrame:
     left_joints: Optional[np.ndarray] = None    # (25,3)
     right_joints: Optional[np.ndarray] = None
 
-    # buttons ride on the control channel; they are low-rate and not
-    # safety-critical, so they do not justify space in every tracking frame
-    buttons: Tuple[str, ...] = ()
+    # Buttons are deliberately *not* here. They ride on the control channel
+    # because they are low-rate, and they live on `LinkSnapshot.buttons` rather
+    # than on the frame so there is exactly one place to read them from. An
+    # earlier version carried an always-empty tuple on this dataclass, which
+    # read like the source of truth and quietly disabled every button.
 
 
 def _pack_pose(mat: np.ndarray) -> bytes:
@@ -208,6 +210,19 @@ DEVICE_MESSAGES = frozenset({
     "estop",       # {}
     "pong",        # {t}
 })
+
+#: The full button vocabulary, shared by every device implementation. A name
+#: outside this set is dropped rather than passed through: the host maps these
+#: onto real actions (`right_a` quits, both thumbstick clicks damp the robot),
+#: so an app that invents a name must not be able to reach those actions by
+#: accident, and a typo must fail loudly at review rather than silently at
+#: runtime. Adding a name is a protocol change -- change both sides together.
+BUTTON_NAMES = frozenset({
+    "left_a", "right_a",          # X on the left controller, A on the right
+    "left_b", "right_b",          # Y on the left controller, B on the right
+    "left_thumb", "right_thumb",  # thumbstick clicks
+})
+
 
 HOST_MESSAGES = frozenset({
     "state",         # {session, reason}

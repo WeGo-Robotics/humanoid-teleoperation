@@ -10,7 +10,9 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net.WebSockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -36,6 +38,11 @@ namespace WeGo.Teleop
         public bool IsConnected => _socket != null &&
                                    _socket.State == WebSocketState.Open;
 
+        /// <summary>Frames skipped because a send was still in flight. Surfaced
+        /// on the HUD: a number that climbs means the link cannot keep up with
+        /// the capture rate, which is worth seeing before it becomes latency.</summary>
+        public int SkippedFrames { get; private set; }
+
         /// <summary>Control messages from the host, drained on the main thread.</summary>
         public readonly ConcurrentQueue<string> Inbound = new ConcurrentQueue<string>();
 
@@ -45,10 +52,12 @@ namespace WeGo.Teleop
         private Task _receiveLoop;
         private uint _seq;
 
-        // Reused so the 72Hz send path allocates nothing.
+        // Reused so the 72Hz send path allocates nothing. Only ever written
+        // while _sendLock is held -- see SendTrackingAsync.
         private readonly byte[] _controllerBuffer = new byte[240];
         private readonly byte[] _handBuffer = new byte[840];
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
+        private readonly StringBuilder _json = new StringBuilder(160);
 
         public XrLinkClient(string url) { _url = url; }
 
@@ -107,8 +116,22 @@ namespace WeGo.Teleop
                 var result = await _socket.ReceiveAsync(
                     new ArraySegment<byte>(buffer), token);
                 if (result.MessageType == WebSocketMessageType.Close) return;
-                if (result.MessageType == WebSocketMessageType.Text)
-                    Inbound.Enqueue(Encoding.UTF8.GetString(buffer, 0, result.Count));
+                if (result.MessageType != WebSocketMessageType.Text) continue;
+
+                if (!result.EndOfMessage)
+                {
+                    // Host control messages are a few hundred bytes; anything
+                    // that fragments an 8KB buffer is not a message we know how
+                    // to read. Drain it and drop it rather than enqueue a
+                    // truncated fragment that JsonUtility would parse into a
+                    // plausible-looking object with missing fields.
+                    Debug.LogWarning("[XrLink] oversized host message, dropping");
+                    while (!result.EndOfMessage && !token.IsCancellationRequested)
+                        result = await _socket.ReceiveAsync(
+                            new ArraySegment<byte>(buffer), token);
+                    continue;
+                }
+                Inbound.Enqueue(Encoding.UTF8.GetString(buffer, 0, result.Count));
             }
         }
 
@@ -128,6 +151,9 @@ namespace WeGo.Teleop
         public async Task SendControlAsync(string json)
         {
             if (!IsConnected) return;
+            // Control messages queue rather than skip: presence, buttons and
+            // estop are events, and a dropped event is not recoverable the way
+            // a dropped tracking frame is.
             await _sendLock.WaitAsync();
             try
             {
@@ -151,16 +177,40 @@ namespace WeGo.Teleop
 
         public void SendEstop() { _ = SendControlAsync("{\"t\":\"estop\"}"); }
 
-        public async Task SendTrackingAsync(in TrackingSample s)
+        /// <summary>The full set of buttons currently held. Level-triggered:
+        /// the host replaces its whole set with this one, so a dropped message
+        /// self-corrects on the next send rather than sticking a button down.
+        /// Names must come from BUTTON_NAMES in codec.py.</summary>
+        public void SendButtons(List<string> pressed)
+        {
+            _json.Clear();
+            _json.Append("{\"t\":\"buttons\",\"pressed\":[");
+            for (var i = 0; i < pressed.Count; i++)
+            {
+                if (i > 0) _json.Append(',');
+                _json.Append('"').Append(pressed[i]).Append('"');
+            }
+            _json.Append("]}");
+            _ = SendControlAsync(_json.ToString());
+        }
+
+        /// <summary>Skips the frame if a send is already in flight rather than
+        /// queueing behind it. At 72Hz a queued frame is stale by the time it
+        /// leaves, and a backlog turns a slow link into growing latency --
+        /// which the host cannot distinguish from the operator moving slowly.
+        /// Dropping is visible (SkippedFrames, and the host's staleness
+        /// watchdog); queueing is not.</summary>
+        public async Task SendTrackingAsync(TrackingSample s)
         {
             if (!IsConnected) return;
-
-            var buffer = s.HandMode ? _handBuffer : _controllerBuffer;
-            var n = Pack(buffer, in s);
-
-            await _sendLock.WaitAsync();
+            if (!await _sendLock.WaitAsync(0)) { SkippedFrames++; return; }
             try
             {
+                // Packed inside the lock: the buffers are reused, so packing
+                // outside it would let one frame rewrite bytes that SendAsync
+                // is still reading from the previous one.
+                var buffer = s.HandMode ? _handBuffer : _controllerBuffer;
+                var n = Pack(buffer, in s);
                 await _socket.SendAsync(new ArraySegment<byte>(buffer, 0, n),
                                         WebSocketMessageType.Binary, true, _cts.Token);
             }
@@ -180,8 +230,6 @@ namespace WeGo.Teleop
             if (s.HandMode) flags |= Flags.HandMode;
 
             var o = 0;
-            // BitConverter is little-endian on ARM/x64, which is what the wire
-            // format specifies. Asserted once at startup by TeleopSession.
             WriteU16(b, ref o, Magic);
             b[o++] = ProtoVersion;
             b[o++] = (byte)flags;
@@ -229,17 +277,42 @@ namespace WeGo.Teleop
             }
         }
 
+        // Bytes are emitted explicitly rather than via BitConverter.GetBytes:
+        // that allocates a throwaway array per value (56 per frame at 72Hz, in
+        // VR, where GC spikes are visible as judder), and it assumes the host
+        // is little-endian. Writing the bytes by hand costs nothing and makes
+        // the wire format independent of the CPU it is produced on.
+        [StructLayout(LayoutKind.Explicit)]
+        private struct F32Bits
+        {
+            [FieldOffset(0)] public float F;
+            [FieldOffset(0)] public uint U;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct F64Bits
+        {
+            [FieldOffset(0)] public double D;
+            [FieldOffset(0)] public ulong U;
+        }
+
         private static void WriteU16(byte[] b, ref int o, ushort v)
-        { b[o++] = (byte)(v & 0xFF); b[o++] = (byte)(v >> 8); }
+        { b[o++] = (byte)v; b[o++] = (byte)(v >> 8); }
 
         private static void WriteU32(byte[] b, ref int o, uint v)
         { for (var i = 0; i < 4; i++) b[o++] = (byte)(v >> (8 * i)); }
 
         private static void WriteF32(byte[] b, ref int o, float v)
-        { Buffer.BlockCopy(BitConverter.GetBytes(v), 0, b, o, 4); o += 4; }
+        {
+            var bits = new F32Bits { F = v }.U;
+            for (var i = 0; i < 4; i++) b[o++] = (byte)(bits >> (8 * i));
+        }
 
         private static void WriteF64(byte[] b, ref int o, double v)
-        { Buffer.BlockCopy(BitConverter.GetBytes(v), 0, b, o, 8); o += 8; }
+        {
+            var bits = new F64Bits { D = v }.U;
+            for (var i = 0; i < 8; i++) b[o++] = (byte)(bits >> (8 * i));
+        }
     }
 
     public struct TrackingSample

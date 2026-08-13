@@ -62,6 +62,8 @@ class NativeXRSource(XRSource):
             )
 
         inputs = frame.inputs
+        # From the control channel, not the tracking frame -- see LinkSnapshot.
+        buttons = snap.buttons
         # Raw OpenXR on the wire; the transform lives here, shared with every
         # other device implementation. `valid` reports any pose that had to be
         # replaced by a fallback, which then counts as untracked rather than
@@ -95,10 +97,10 @@ class NativeXRSource(XRSource):
             right_ctrl_triggerValue=inputs.get("right_trigger_value", 10.0),
             left_ctrl_trigger=inputs.get("left_trigger_value", 10.0) < 1.0,
             right_ctrl_trigger=inputs.get("right_trigger_value", 10.0) < 1.0,
-            left_ctrl_aButton="left_a" in frame.buttons,
-            right_ctrl_aButton="right_a" in frame.buttons,
-            left_ctrl_thumbstick="left_thumb" in frame.buttons,
-            right_ctrl_thumbstick="right_thumb" in frame.buttons,
+            left_ctrl_aButton="left_a" in buttons,
+            right_ctrl_aButton="right_a" in buttons,
+            left_ctrl_thumbstick="left_thumb" in buttons,
+            right_ctrl_thumbstick="right_thumb" in buttons,
             left_ctrl_thumbstickValue=np.array(
                 [inputs.get("left_thumb_x", 0.0), inputs.get("left_thumb_y", 0.0)]),
             right_ctrl_thumbstickValue=np.array(

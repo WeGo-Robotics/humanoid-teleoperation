@@ -131,5 +131,64 @@ class TestIPCCommandContract(unittest.TestCase):
             self.assertIn(key, handled, f"{cmd} maps to '{key}', unhandled in on_press")
 
 
+class TestQuestAppMatchesTheWireFormat(unittest.TestCase):
+    """The only automated link between the C# client and the Python host.
+
+    Nothing else checks them against each other: the app is built by Unity, the
+    host by pytest, and a mismatch surfaces as a decode error on a robot with a
+    person standing in front of it. These are crude string checks on purpose --
+    a crude check that runs is worth more than a precise one that needs a Unity
+    licence in CI.
+    """
+
+    QUEST = os.path.join(os.path.dirname(TELEOP), "quest_app", "Assets", "Scripts")
+
+    def source(self, name):
+        path = os.path.join(self.QUEST, name)
+        if not os.path.exists(path):
+            self.skipTest(f"{name} not present")
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_protocol_version_matches(self):
+        from xr.codec import PROTO_VERSION
+        src = self.source("XrLinkClient.cs")
+        self.assertIn(f"ProtoVersion = {PROTO_VERSION};", src,
+                      "the app and the host disagree about the protocol version")
+
+    def test_magic_matches(self):
+        from xr.codec import MAGIC
+        src = self.source("XrLinkClient.cs")
+        self.assertIn(f"Magic = 0x{MAGIC:04X}".lower(), src.lower())
+
+    def test_frame_buffer_sizes_match(self):
+        from xr.codec import BASE_SIZE, HAND_SIZE
+        src = self.source("XrLinkClient.cs")
+        self.assertIn(f"_controllerBuffer = new byte[{BASE_SIZE}]", src)
+        self.assertIn(f"_handBuffer = new byte[{HAND_SIZE}]", src)
+
+    def test_the_hud_names_every_state_the_host_can_send(self):
+        """A state with no case falls through to the neutral colour, so a new
+        SafetyState would render as 'nothing in particular' on the headset --
+        including a new one that means the robot has stopped."""
+        from safety.types import SafetyState
+        src = self.source("TeleopHud.cs")
+        expected = {s.value.upper() for s in SafetyState} | {"ALIGN"}
+        missing = {s for s in expected if f'case "{s}":' not in src}
+        self.assertFalse(missing,
+                         f"TeleopHud has no colour case for: {sorted(missing)}")
+
+    def test_every_button_the_app_sends_is_one_the_host_knows(self):
+        from xr.codec import BUTTON_NAMES
+        import re
+        src = self.source("TeleopSession.cs")
+        sent = {m for m in re.findall(r'"([a-z]+_[a-z]+)"', src)
+                if m.split("_")[0] in ("left", "right")}
+        self.assertTrue(sent, "found no button names in TeleopSession.cs")
+        unknown = sent - BUTTON_NAMES
+        self.assertFalse(unknown,
+                         f"the app sends buttons the host drops: {sorted(unknown)}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
