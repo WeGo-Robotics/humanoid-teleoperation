@@ -842,3 +842,144 @@ process-kill to confirm the fallback still latches within `dead_s`. If the fast 
 - TLS, as above.
 - XrLink has still never met a real device. Expect protocol friction at first contact; the simulator is what makes that
   cheap to resolve.
+
+---
+
+## 13. The APK — as built
+
+Phase 3 left two C# files and a runbook. This section covers turning that into an installable artefact, and the four
+defects that surfaced in the process. `quest_app/` is now a real Unity project that builds from a clean clone with one
+command.
+
+### 13.1 What was added
+
+| Path | What |
+|---|---|
+| `quest_app/Packages/manifest.json` | Meta XR Core SDK 78.0.0 via Meta's npm registry, Oculus XR Plugin 4.5.1 |
+| `quest_app/Assets/Editor/QuestBuild.cs` | Every build setting, as code. Generates the scene, assigns the XR loader, builds |
+| `quest_app/Assets/Editor/QuestManifest.cs` | Patches the generated Android manifest — permission, cleartext, focus-aware, VR category |
+| `quest_app/Assets/Scripts/TeleopBootstrap.cs` | Builds the camera rig, passthrough, session and HUD at runtime |
+| `quest_app/Assets/Scripts/TeleopHud.cs` | In-headset status panel |
+| `tools/build_quest_apk.ps1` | Locates the toolchain, runs batchmode, sideloads |
+
+The `.unity` scene is deliberately **not** committed. A Unity scene file is generated YAML full of GUIDs pointing into
+a package that gets upgraded: unreviewable in a diff, and it breaks in ways that only reproduce on the machine that
+opened it. The scene graph here is fifteen objects, so `TeleopBootstrap` builds it at runtime and `QuestBuild`
+generates the one-object scene that holds it. The practical benefit is that the Editor build script needs no knowledge
+of the Meta SDK at all — every OVR reference in the project sits in two runtime files.
+
+`ProjectSettings/` **is** committed, but `QuestBuild` re-applies every setting that matters on each build anyway. A
+wrong scripting backend or a missing ARM64 flag is invisible in a diff and does not surface until the APK fails on a
+device, so the committed files are the starting point and the code is the guarantee.
+
+### 13.2 Building it
+
+```powershell
+.\tools\build_quest_apk.ps1 -HostAddress 192.168.123.2 -Install
+```
+
+Prerequisite, and how to get it:
+
+```powershell
+& 'C:\Program Files\Unity Hub\Unity Hub.exe' -- --headless install-modules --version 2022.3.32f1 -m android --childModules
+```
+
+That pulls Android Build Support, the SDK, the NDK and OpenJDK — everything, including `adb`. Unity 2022.3.32f1 with
+Meta XR Core SDK 78.0.0 is the pinned pairing; 78.0.0 declares `unity: 2022.3` / `unityRelease: 15f1`, so the installed
+editor sits inside its support window.
+
+First build ~9 minutes (package resolution plus a cold IL2CPP compile), later builds a couple of minutes. Output is a
+**23.8 MB** APK: ARM64 only, IL2CPP, minSdk 32 / targetSdk 34.
+
+The host address is **baked in at build time** — a new Host PC means a new build. That is deliberate: a runtime address
+picker is one more thing to get wrong while wearing a headset, and MDM pushes a per-site APK anyway.
+
+### 13.3 Four defects found on the way
+
+Worth recording, because three of them were latent in code that had already been reviewed and tested.
+
+**1. Buttons were wired to nothing.** `codec.py` defined a `buttons` control message, `native_source.py` read
+`frame.buttons`, and `TrackingFrame.buttons` was a tuple that was always empty — the server had no branch to populate
+it, and the app never sent one. On the native path `right_a` (quit) and both thumbstick clicks (**damp — the soft
+emergency stop**) silently did nothing. The always-empty field is what made it invisible: it read like the source of
+truth. Buttons now live on `LinkSnapshot`, that field is gone, and `BUTTON_NAMES` is the shared vocabulary.
+
+**2. The app did not compile.** `SendTrackingAsync(in TrackingSample)` — C# forbids `in` parameters on async methods
+(CS1988). Two further hazards sat in the same method: `Pack()` wrote into a reused buffer *before* taking the send
+lock, so overlapping sends could rewrite bytes mid-transmit; and every tracking frame was queued rather than dropped,
+which turns a slow link into unbounded latency the host cannot distinguish from an operator moving slowly. Packing now
+happens inside the lock, and a frame that finds a send already in flight is **skipped and counted**
+(`SkippedFrames`, shown on the HUD) rather than queued.
+
+**3. `OVRManager.isUserPresent` is an instance property, not static** — and the instance is null until the rig wakes.
+Presence now reads `ovr != null && ovr.isUserPresent`, so absence of evidence is reported as absence. Fail-closed.
+
+**4. The simulator was streaming at ~10,000 Hz, not 72 Hz.** `time.monotonic()` has 15.6 ms granularity on Windows
+before Python 3.13, and asyncio fires any timer due within one clock resolution — so `await asyncio.sleep(1/72)`
+returns immediately once the event loop has other work, which it does the moment a websocket is attached. Every timing
+observation made with `fake_quest` on a Windows box was therefore made against a flood. `_stream` now paces on an
+absolute `perf_counter` schedule and prints its measured rate; verified at 72 Hz.
+
+### 13.4 What the app does
+
+| State | Shown when |
+|---|---|
+| `DISCONNECTED` | no link to the host; reconnecting with backoff |
+| `WAITING` | linked, headset donned, host has not started a session |
+| `ALIGN` | host is running the alignment gate — progress bar live |
+| `FOLLOWING` | host is driving the arms from this headset |
+| `HOLD` | transient fault; arms frozen |
+| `SAFE_STOP` | latched fault; needs an acknowledgement on the host |
+| `DOFFED` | headset came off |
+
+The host now pushes `{"t":"state"}` for the **whole** session rather than only during alignment — on change, then every
+0.5 s as a keepalive, and every 0.1 s while aligning, where the operator is adjusting their stance against a progress
+bar. Before this the headset could only ever display `ALIGN`. An operator in passthrough can see the robot but not
+*why* it stopped: the terminal log is on the host and they are wearing a headset.
+
+**Emergency stop: Y + B**, the secondary face button on each controller. Symmetric, reachable without looking, and not
+bound to anything else — A/X quits and the thumbstick clicks damp. It *requests* a stop; the host decides, exactly like
+every other signal from the device.
+
+### 13.5 Bring-up order
+
+In order. Each step is cheap to debug because the one before it is known good.
+
+1. **Host with the simulator — no headset, no robot.**
+
+```bash
+python teleop/teleop_hand_and_arm.py --ipc --xr-source xrlink --sim
+python tools/fake_quest.py --scenario steady      # follows, zero faults
+python tools/fake_quest.py --scenario doff        # operator_absent, latched
+python tools/fake_quest.py --scenario buttons     # damp, then quit
+```
+
+`steady` matters as much as the fault cases: a safety layer that stops the robot during normal operation is an outage,
+not a safety layer.
+
+2. **Headset against the host, robot still off.** Sideload, launch, confirm `WAITING` on the HUD and a device
+connection in the host log. Then doff it and watch the host latch. This is first contact between the C# client and the
+Python host — expect protocol friction here and nowhere else, because everything upstream is already proven.
+
+3. **Doff-latency measurement (§10.3).** p50/p95 over 20 doffs, warm and cold, plus a process kill to confirm the
+watchdog fallback still latches within `dead_s`. **Be willing to conclude the presence message does not earn its
+place**: if its p95 is not comfortably under `stale_s`, the design should lean entirely on the watchdog and the fast
+path should be deleted rather than trusted.
+
+4. **Robot, arms clear, hand on the host keyboard.** Only now.
+
+### 13.6 Verified, and not
+
+Verified here: the APK builds from a clean clone; ARM64 + IL2CPP + `libOVRPlugin.so` + `libopenxr_loader.so` are in it;
+the manifest carries INTERNET, cleartext, `com.oculus.vr.focusaware`, the VR launcher category and
+`com.oculus.supportedDevices`; the button path drives the real `XrLinkServer` → `NativeXRSource` end to end at 72 Hz;
+167 host tests pass, four of which check the C# source against `codec.py` for protocol version, magic number, frame
+sizes and button vocabulary.
+
+**Not verified: any of it on a headset.** No Quest has run this APK. The handedness flip, the presence timing, the
+passthrough setup and the HUD placement are all unexercised. §12.6 lists handedness first for a reason — if the arms
+mirror left and right, `ToOpenXR()` is the only thing that can cause it.
+
+Still open beyond that: TLS (`UseTls = false` is the default because there is no server-side context to talk to —
+isolated lab network only, and this remains the one thing that looks finished and is not), hand tracking and its 26→25
+joint mapping, and threshold tuning against real human motion rather than synthetic.
