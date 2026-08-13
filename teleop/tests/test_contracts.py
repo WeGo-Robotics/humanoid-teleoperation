@@ -167,6 +167,17 @@ class TestQuestAppMatchesTheWireFormat(unittest.TestCase):
         self.assertIn(f"_controllerBuffer = new byte[{BASE_SIZE}]", src)
         self.assertIn(f"_handBuffer = new byte[{HAND_SIZE}]", src)
 
+    def test_the_hud_names_every_state_the_host_can_send(self):
+        """A state with no case falls through to the neutral colour, so a new
+        SafetyState would render as 'nothing in particular' on the headset --
+        including a new one that means the robot has stopped."""
+        from safety.types import SafetyState
+        src = self.source("TeleopHud.cs")
+        expected = {s.value.upper() for s in SafetyState} | {"ALIGN"}
+        missing = {s for s in expected if f'case "{s}":' not in src}
+        self.assertFalse(missing,
+                         f"TeleopHud has no colour case for: {sorted(missing)}")
+
     def test_every_button_the_app_sends_is_one_the_host_knows(self):
         from xr.codec import BUTTON_NAMES
         import re

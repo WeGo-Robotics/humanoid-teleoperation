@@ -124,9 +124,14 @@ namespace WeGo.Teleop
         private static Color ColourFor(string session, bool linked)
         {
             if (!linked) return Bad;
+            // Every state the host can send is named here, including the ones
+            // that want the neutral colour. A state that falls through to the
+            // default is one nobody decided how to display -- see the contract
+            // test in teleop/tests/test_contracts.py, which enforces it.
             switch (session)
             {
                 case "FOLLOWING": return Good;
+                case "IDLE": return Dim;
                 case "ALIGN":
                 case "HOLD":
                 case "WAITING": return Warn;

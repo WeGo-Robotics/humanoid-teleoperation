@@ -379,16 +379,26 @@ if __name__ == '__main__':
             logger_mp.info("▶️  following armed")
 
         def _session_label():
-            """(session, reason) as the headset should display it."""
+            """(session, reason, dedupe_key) as the headset should display it.
+
+            The dedupe key ignores the reason *text* on purpose. A stale fault's
+            detail changes every cycle -- "stale(213ms)", then "stale(247ms)" --
+            so keying on it would push a message at the full loop rate over a
+            link that is, by definition, already struggling. The fault kinds are
+            what actually changed; the text is only there to be read.
+            """
             snap = SAFETY.snapshot()
+            faults = tuple(snap["faults"])
             if snap["latched"]:
-                return "SAFE_STOP", snap["reason"]
+                return "SAFE_STOP", snap["reason"], ("SAFE_STOP", faults)
             if not was_following:
-                return "IDLE", "" if snap["link_up"] else snap["reason"]
-            return snap["state"].upper(), snap["reason"]
+                reason = "" if snap["link_up"] else snap["reason"]
+                return "IDLE", reason, ("IDLE", faults)
+            state = snap["state"].upper()
+            return state, snap["reason"], (state, faults)
 
         def _push_device_state(now, session, reason="", align=None,
-                               min_interval=0.5):
+                               min_interval=0.5, key=None):
             """Mirror the host's view of the session into the headset.
 
             The operator in passthrough can see the robot but not *why* it
@@ -402,7 +412,8 @@ if __name__ == '__main__':
             the transport is receive-only.
             """
             global _last_state_push, _last_state_key
-            key = (session, reason)
+            if key is None:
+                key = (session, reason)
             if key == _last_state_key and (now - _last_state_push) < min_interval:
                 return
             _last_state_push, _last_state_key = now, key
@@ -499,7 +510,8 @@ if __name__ == '__main__':
 
             # Alignment pushes its own richer message below, including progress.
             if not aligning:
-                _push_device_state(start_time, *_session_label())
+                _session, _reason, _key = _session_label()
+                _push_device_state(start_time, _session, _reason, key=_key)
 
             # -------------------- START-ALIGNMENT GATE ------------------------
             # The arms stay frozen here. Following begins only once the host

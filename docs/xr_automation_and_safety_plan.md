@@ -925,7 +925,8 @@ absolute `perf_counter` schedule and prints its measured rate; verified at 72 Hz
 | State | Shown when |
 |---|---|
 | `DISCONNECTED` | no link to the host; reconnecting with backoff |
-| `WAITING` | linked, headset donned, host has not started a session |
+| `WAITING` | headset just donned; set by the app until the host says otherwise |
+| `IDLE` | host is linked and healthy but not following |
 | `ALIGN` | host is running the alignment gate — progress bar live |
 | `FOLLOWING` | host is driving the arms from this headset |
 | `HOLD` | transient fault; arms frozen |
@@ -972,13 +973,16 @@ path should be deleted rather than trusted.
 
 Verified here: the APK builds from a clean clone; ARM64 + IL2CPP + `libOVRPlugin.so` + `libopenxr_loader.so` are in it;
 the manifest carries INTERNET, cleartext, `com.oculus.vr.focusaware`, the VR launcher category and
-`com.oculus.supportedDevices`; the button path drives the real `XrLinkServer` → `NativeXRSource` end to end at 72 Hz;
-167 host tests pass, four of which check the C# source against `codec.py` for protocol version, magic number, frame
-sizes and button vocabulary.
+`com.oculus.supportedDevices`; the manifest also declares `com.oculus.feature.PASSTHROUGH`; the button path drives the real `XrLinkServer` →
+`NativeXRSource` end to end at 72 Hz; 168 host tests pass, five of which check the C# source against the Python for
+protocol version, magic number, frame sizes, button vocabulary, and that the HUD names every `SafetyState` the host
+can send rather than letting a new one render as "nothing in particular".
 
 **Not verified: any of it on a headset.** No Quest has run this APK. The handedness flip, the presence timing, the
 passthrough setup and the HUD placement are all unexercised. §12.6 lists handedness first for a reason — if the arms
-mirror left and right, `ToOpenXR()` is the only thing that can cause it.
+mirror left and right, `ToOpenXR()` is the only thing that can cause it. If passthrough comes up black, the manifest
+feature is declared `required="false"` (Meta's "Supported" rather than "Required") — that is the first thing to try
+changing, in `QuestManifest.cs`.
 
 Still open beyond that: TLS (`UseTls = false` is the default because there is no server-side context to talk to —
 isolated lab network only, and this remains the one thing that looks finished and is not), hand tracking and its 26→25
