@@ -3,7 +3,9 @@ from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoP
 from multiprocessing import Value, Array, Process, shared_memory
 import numpy as np
 import asyncio
+import functools
 import threading
+import time
 import cv2
 import os
 from pathlib import Path
@@ -135,7 +137,21 @@ class TeleVuer:
         else:
             raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
         
-        self.vuer.spawn(start=False)(fn)
+        self.vuer.spawn(start=False)(self._with_session_tracking(fn))
+
+        # ---- liveness instrumentation ----------------------------------------
+        # Consumed by teleop/safety. Written in the Vuer child process, read in
+        # the teleop parent, so every field has to live in shared memory.
+        # time.monotonic() is a system-wide clock on both Linux (CLOCK_MONOTONIC)
+        # and Windows (GetTickCount64), so stamps taken in the child are directly
+        # comparable in the parent.
+        self.xr_seq_shared = Value('L', 0, lock=True)          # bumped per pose event
+        self.xr_pose_rx_shared = Value('d', 0.0, lock=True)    # last hand/controller event
+        self.xr_head_rx_shared = Value('d', 0.0, lock=True)    # last camera event
+        # Counter, not a flag: Vuer can briefly run overlapping session coroutines
+        # across a reconnect, and a plain bool would report "down" while one is
+        # still live.
+        self.xr_session_count_shared = Value('i', 0, lock=True)
 
         self.head_pose_shared = Array('d', 16, lock=True)
         self.left_arm_pose_shared = Array('d', 16, lock=True)
@@ -178,6 +194,115 @@ class TeleVuer:
         self.process.daemon = True
         self.process.start()
     
+    # ==================== liveness instrumentation ====================
+    def _with_session_tracking(self, fn):
+        """Own the lifetime of one XR session coroutine.
+
+        Two jobs:
+
+        * Presence. Vuer cancels this coroutine when the websocket drops, so the
+          `finally` block is a genuine disconnect signal -- the only one
+          available without patching Vuer itself.
+        * Supersession. Every `main_*` body is an infinite
+          `while True: session.upsert(...)` against fixed `bgChildren` keys.
+          Nothing tore the old one down on reconnect, so each reconnect stacked
+          another render loop pushing frames at the same keys. Cancelling the
+          previous task keeps exactly one alive.
+        """
+        @functools.wraps(fn)
+        async def wrapper(session, *args, **kwargs):
+            self._session_gen = getattr(self, "_session_gen", 0) + 1
+            gen = self._session_gen
+            tasks = getattr(self, "_session_tasks", None)
+            if tasks is None:
+                tasks = self._session_tasks = {}
+            for old_gen, old_task in list(tasks.items()):
+                if old_gen != gen and not old_task.done():
+                    logger_mp.warning(f"[TeleVuer] superseding XR session {old_gen}")
+                    old_task.cancel()
+
+            with self.xr_session_count_shared.get_lock():
+                self.xr_session_count_shared.value += 1
+            logger_mp.info(f"[TeleVuer] XR session {gen} attached")
+
+            task = asyncio.ensure_future(fn(session, *args, **kwargs))
+            tasks[gen] = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                # Either this session was superseded or Vuer is tearing it down.
+                # Swallowed rather than re-raised: the coroutine is ending either
+                # way, and Vuer's spawn machinery treats a raised exception here
+                # as a server-side error.
+                pass
+            except Exception as e:
+                logger_mp.error(f"[TeleVuer] XR session {gen} failed: {e!r}")
+            finally:
+                tasks.pop(gen, None)
+                # Covers both paths: superseded (already cancelled above) and the
+                # wrapper itself being cancelled while the body still runs. An
+                # orphaned body would keep upserting forever.
+                if not task.done():
+                    task.cancel()
+                with self.xr_session_count_shared.get_lock():
+                    self.xr_session_count_shared.value = max(
+                        0, self.xr_session_count_shared.value - 1)
+                logger_mp.warning(f"[TeleVuer] XR session {gen} detached")
+        return wrapper
+
+    def _mark_pose_rx(self):
+        """Record that a fresh hand/controller payload was accepted.
+
+        Called only on the success path: if a handler raises, the sequence does
+        not advance and the watchdog correctly sees the stream as stale. Silent
+        degradation to frozen data is the failure this exists to make visible.
+        """
+        now = time.monotonic()
+        with self.xr_seq_shared.get_lock():
+            self.xr_seq_shared.value = (self.xr_seq_shared.value + 1) & 0xFFFFFFFF
+        with self.xr_pose_rx_shared.get_lock():
+            self.xr_pose_rx_shared.value = now
+
+    def _mark_head_rx(self):
+        with self.xr_head_rx_shared.get_lock():
+            self.xr_head_rx_shared.value = time.monotonic()
+
+    def _warn_throttled(self, where, exc, period=2.0):
+        """Handlers fire at 60-90Hz; an unthrottled log would bury everything
+        else. Never swallow silently though -- a handler that always raises
+        looks exactly like a frozen headset, and the operator needs to be able
+        to tell those apart."""
+        if not hasattr(self, "_warn_at"):
+            self._warn_at = {}
+        now = time.monotonic()
+        if now - self._warn_at.get(where, 0.0) >= period:
+            self._warn_at[where] = now
+            logger_mp.warning(f"[TeleVuer] {where} error: {exc!r}")
+
+    @property
+    def xr_liveness_raw(self):
+        """(seq, last_rx, session_up) as seen by the transport.
+
+        `last_rx` is the *older* of the pose and head stamps: the arm targets are
+        head-relative (see tv_wrapper), so a frozen head is just as dangerous as
+        frozen hands, and freshness must be gated on both.
+        """
+        with self.xr_seq_shared.get_lock():
+            seq = self.xr_seq_shared.value
+        with self.xr_pose_rx_shared.get_lock():
+            pose_rx = self.xr_pose_rx_shared.value
+        with self.xr_head_rx_shared.get_lock():
+            head_rx = self.xr_head_rx_shared.value
+        with self.xr_session_count_shared.get_lock():
+            session_up = self.xr_session_count_shared.value > 0
+        if pose_rx > 0.0 and head_rx > 0.0:
+            last_rx = min(pose_rx, head_rx)
+        else:
+            # One of the two streams has never produced an event. Fall back to
+            # whichever exists rather than reporting a permanent stall.
+            last_rx = max(pose_rx, head_rx)
+        return seq, last_rx, session_up
+
     def _vuer_run(self):
         try:
             self.vuer.run()
@@ -208,24 +333,43 @@ class TeleVuer:
         self.new_frame_event.set()
 
     def close(self):
-        self.process.terminate()
-        self.process.join(timeout=0.5)
-        if self.display_mode in ("immersive", "ego") and not self.webrtc:
+        uses_shm = self.display_mode in ("immersive", "ego") and not self.webrtc
+        # Stop the writer thread *before* killing the Vuer process. The old order
+        # terminated the process first, leaving the writer free to keep copying
+        # frames into shared memory that was about to be unlinked.
+        if uses_shm:
             self.stop_writer_event.set()
-            self.new_frame_event.set()
-            self.writer_thread.join(timeout=0.5)
+            self.new_frame_event.set()      # wake it out of its wait
+            self.writer_thread.join(timeout=1.0)
+            if self.writer_thread.is_alive():
+                logger_mp.warning("[TeleVuer] XR render thread did not stop cleanly")
+
+        self.process.terminate()
+        self.process.join(timeout=1.0)
+        if self.process.is_alive():
+            logger_mp.warning("[TeleVuer] Vuer process ignored terminate; killing")
+            self.process.kill()
+            self.process.join(timeout=0.5)
+
+        if uses_shm:
             try:
                 self.img2display_shm.close()
+            except Exception as e:
+                logger_mp.warning(f"[TeleVuer] shm close failed: {e}")
+            try:
                 self.img2display_shm.unlink()
-            except:
-                pass
+            except FileNotFoundError:
+                pass                        # already reclaimed
+            except Exception as e:
+                logger_mp.warning(f"[TeleVuer] shm unlink failed: {e}")
 
     async def on_cam_move(self, event, session, fps=60):
         try:
             with self.head_pose_shared.get_lock():
                 self.head_pose_shared[:] = event.value["camera"]["matrix"]
-        except:
-            pass
+            self._mark_head_rx()
+        except Exception as e:
+            self._warn_throttled("on_cam_move", e)
 
     async def on_controller_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html"""
@@ -263,8 +407,9 @@ class TeleVuer:
 
             extract_controllers(left_controller, "left")
             extract_controllers(right_controller, "right")
-        except:
-            pass
+            self._mark_pose_rx()
+        except Exception as e:
+            self._warn_throttled("on_controller_move", e)
 
     async def on_hand_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/19_hand_tracking.html"""
@@ -309,17 +454,16 @@ class TeleVuer:
             extract_hand_poses(right_hand_data, self.right_arm_pose_shared, self.right_hand_position_shared, self.right_hand_orientation_shared)
             extract_hands(left_hand, "left")
             extract_hands(right_hand, "right")
+            self._mark_pose_rx()
 
             if not hasattr(self, "_hand_move_count"):
                 self._hand_move_count = 0
             if self._hand_move_count < 20:
-                import logging_mp
-                logging_mp.get_logger(__name__).info(f"[on_hand_move] recv hand data. left_arm_pose[0:4]={left_hand_data[0:4]}")
+                logger_mp.info(f"[on_hand_move] recv hand data. left_arm_pose[0:4]={left_hand_data[0:4]}")
                 self._hand_move_count += 1
 
         except Exception as e:
-            import logging_mp
-            logging_mp.get_logger(__name__).warning(f"[on_hand_move] error: {e}")
+            self._warn_throttled("on_hand_move", e)
     
     ## immersive MODE
     async def main_image_binocular_zmq(self, session):

@@ -322,58 +322,98 @@ class ZMQ_SubscriberThread(threading.Thread):
         if self.is_alive():
             logger_mp.warning("Subscriber thread did not stop gracefully")
 
+    RECONNECT_MIN_WAIT = 0.5
+    RECONNECT_MAX_WAIT = 5.0
+
     def run(self) -> None:
-        """Main subscriber loop with socket creation in worker thread."""
-        try:
-            # Create socket in the worker thread
-            self._socket = self._context.socket(zmq.SUB)
-            self._socket.setsockopt(zmq.RCVHWM, 1)  # Only keep latest message
-            self._socket.setsockopt(zmq.LINGER, 0)
-            self._socket.connect(f"tcp://{self._host}:{self._port}")
-            self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        """Supervise a subscriber socket for the lifetime of the thread.
 
-            poller = zmq.Poller()
-            poller.register(self._socket, zmq.POLLIN)
+        The receive loop used to `break` out of the thread on the first
+        recv/decode error. The thread then exited while the manager kept holding
+        the dead object, so every later `get_head_frame()` read a corpse -- the
+        head camera feed stopped for the rest of the session with no reconnect
+        and no error. Errors now tear down the socket and rebuild it with
+        backoff; only `stop()` ends the thread.
+        """
+        backoff = self.RECONNECT_MIN_WAIT
+        while self._running:
+            socket = None
+            try:
+                socket = self._context.socket(zmq.SUB)
+                socket.setsockopt(zmq.RCVHWM, 1)  # Only keep latest message
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.connect(f"tcp://{self._host}:{self._port}")
+                socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-            # Signal that socket is ready
-            self._started.set()
-            while self._running:
-                events = dict(poller.poll(timeout=100))
-                if self._socket in events:
-                    try:
-                        # receive the latest message
-                        img_bytes = self._socket.recv()
-                        img_numpy = self._decode_image(img_bytes)  # decode JPEG bytes to bgr image
-                        self._update_fps()                         # update fps
-                        self._triple_ring_buffer.write(img_numpy)  # write to 3-ring-buffer
-                    except Exception as e:
-                        if self._running:
-                            logger_mp.error(f"Error in subscriber loop: {e}")
-                        break
-                else:
-                    self._triple_ring_buffer.write(None)
-                    logger_mp.debug(f"No message received from {self._host}:{self._port} within timeout.")
-        except Exception as e:
-            logger_mp.error(f"Failed to initialize subscriber socket: {e}")
-        finally:
-            # Ensure socket is closed when thread exits
-            if self._socket:
-                try:
-                    self._socket.close()
-                except Exception as e:
-                    logger_mp.warning(f"Error closing socket in cleanup: {e}")
+                poller = zmq.Poller()
+                poller.register(socket, zmq.POLLIN)
+
+                self._socket = socket
+                self._started.set()   # socket is ready (first attempt only matters)
+                backoff = self.RECONNECT_MIN_WAIT
+                self._recv_loop(socket, poller)
+            except zmq.error.ContextTerminated:
+                break
+            except Exception as e:
+                if self._running:
+                    logger_mp.error(
+                        f"[ZMQ_SubscriberThread] {self._host}:{self._port} "
+                        f"socket error: {e}")
+            finally:
                 self._socket = None
+                if socket is not None:
+                    try:
+                        socket.close(0)
+                    except Exception as e:
+                        logger_mp.warning(f"Error closing socket in cleanup: {e}")
+
+            if self._running:
+                # Consumers must see "no frame", not the last frame from before
+                # the drop, while we are disconnected.
+                self._triple_ring_buffer.write(None)
+                logger_mp.warning(
+                    f"[ZMQ_SubscriberThread] {self._host}:{self._port} "
+                    f"reconnecting in {backoff:.1f}s")
+                self._sleep(backoff)
+                backoff = min(backoff * 2.0, self.RECONNECT_MAX_WAIT)
+
+    def _recv_loop(self, socket, poller) -> None:
+        """Receive until stopped or the socket errors. Returning means reconnect."""
+        while self._running:
+            events = dict(poller.poll(timeout=100))
+            if socket in events:
+                img_bytes = socket.recv()
+                img_numpy = self._decode_image(img_bytes)  # decode JPEG bytes to bgr image
+                self._update_fps()                         # update fps
+                self._triple_ring_buffer.write(img_numpy)  # write to 3-ring-buffer
+            else:
+                self._triple_ring_buffer.write(None)
+                logger_mp.debug(f"No message received from {self._host}:{self._port} within timeout.")
+
+    def _sleep(self, seconds: float) -> None:
+        """Interruptible sleep, so stop() is honoured promptly."""
+        deadline = time.monotonic() + seconds
+        while self._running and time.monotonic() < deadline:
+            time.sleep(0.05)
 
 class ZMQ_SubscriberManager:
-    """Centralized management of ZMQ subscribers."""
+    """Centralized management of ZMQ subscribers.
+
+    State is per-instance. It used to be class-level, which meant `close()` set
+    `_running = False` on the *class* permanently: any second ImageClient built
+    in the same process -- reconnecting after a server restart, or a second
+    teleop run without relaunching -- raised "SubscriberManager is closed" and
+    could never recover.
+    """
 
     _instance: Optional["ZMQ_SubscriberManager"] = None
-    _subscriber_threads: Dict[Tuple[str, int], ZMQ_SubscriberThread] = {}
-    _lock = threading.Lock()
-    _running = True
+    _instance_lock = threading.Lock()
 
     def __init__(self):
         self._context = zmq.Context()
+        self._subscriber_threads: Dict[Tuple[str, int], ZMQ_SubscriberThread] = {}
+        self._lock = threading.Lock()
+        self._running = True
 
     def _create_subscriber_thread(self, host: str, port: int) -> ZMQ_SubscriberThread:
         try:
@@ -399,12 +439,15 @@ class ZMQ_SubscriberManager:
     # --------------------------------------------------------
     @classmethod
     def get_instance(cls) -> "ZMQ_SubscriberManager":
-        """Get or create the singleton instance with thread safety."""
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = cls()
-        return cls._instance
+        """Get or create the singleton instance with thread safety.
+
+        A closed instance is replaced rather than handed out again, so building
+        a new ImageClient after a shutdown works.
+        """
+        with cls._instance_lock:
+            if cls._instance is None or not cls._instance._running:
+                cls._instance = cls()
+            return cls._instance
 
     def subscribe(self, host: str, port: int) -> Tuple[Optional[np.ndarray], float]:
         """Receive the latest message from the specified subscriber.
@@ -423,16 +466,38 @@ class ZMQ_SubscriberManager:
         return subscriber_thread.recv(), subscriber_thread.get_fps()
 
     def close(self) -> None:
-        """Close all subscribers."""
+        """Close all subscribers and retire this instance."""
         self._running = False
         # close all subscribers
         with self._lock:
-            for key, subscriber in self._subscriber_threads.items():
+            subscribers = list(self._subscriber_threads.items())
+            for key, subscriber in subscribers:
                 try:
                     subscriber.stop()
                 except Exception as e:
                     logger_mp.error(f"Error stopping subscriber at {key[0]}:{key[1]}: {e}")
             self._subscriber_threads.clear()
+
+        # Each thread closes its own socket on the way out, so once they have all
+        # stopped term() returns immediately. If one did not stop within its join
+        # timeout it still owns a live socket: neither term() (blocks forever) nor
+        # destroy() (closes the socket under the running thread, which aborts the
+        # process inside libzmq) is safe, so the context is leaked instead. A
+        # leaked context at shutdown beats a hang or a crash.
+        stragglers = [f"{k[0]}:{k[1]}" for k, t in subscribers if t.is_alive()]
+        if stragglers:
+            logger_mp.warning(
+                f"Subscriber threads still running ({', '.join(stragglers)}); "
+                f"leaking the ZMQ context rather than closing sockets under them")
+        else:
+            try:
+                self._context.term()
+            except Exception as e:
+                logger_mp.warning(f"Error terminating subscriber context: {e}")
+        # Drop the singleton so the next get_instance() builds a working one.
+        with ZMQ_SubscriberManager._instance_lock:
+            if ZMQ_SubscriberManager._instance is self:
+                ZMQ_SubscriberManager._instance = None
 
 # ========================================================
 # ZMQ response

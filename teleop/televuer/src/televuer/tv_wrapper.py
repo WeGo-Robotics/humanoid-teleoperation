@@ -1,7 +1,7 @@
 import numpy as np
 from .televuer import TeleVuer
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 """
 (basis) OpenXR Convention : y up, z back, x right. 
 (basis) Robot  Convention : z up, y left, x front.  
@@ -138,6 +138,22 @@ CONST_LEFT_ARM_POSE = np.array([[1, 0, 0, -0.15],
 
 CONST_HAND_ROT = np.tile(np.eye(3)[None, :, :], (25, 1, 1))
 
+@dataclass(frozen=True)
+class XRLinkStatus:
+    """Transport-level health of the XR link, paired with one TeleData payload.
+
+    Field names line up with `teleop.safety.XRLiveness` so the teleop process can
+    convert with `XRLiveness(**asdict(status))`. Kept as a separate type here so
+    the televuer package stays independent of the teleop safety layer.
+    """
+    seq: int                        # bumped once per accepted pose event
+    last_rx: float                  # time.monotonic() of the newest pose event
+    session_up: bool                # an XR session is currently attached
+    left_tracked: bool
+    right_tracked: bool
+    worn: Optional[bool] = None     # None: this transport cannot report presence
+
+
 @dataclass
 class TeleData:
     head_pose: np.ndarray                  # (4,4) SE(3) pose of head matrix
@@ -236,9 +252,34 @@ class TeleVuerWrapper:
         self.use_hand_tracking = use_hand_tracking
         self.return_hand_rot_data = return_hand_rot_data
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
-                              display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
+                              display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url,
                               cert_file=cert_file, key_file=key_file)
-        
+        self._link_status = XRLinkStatus(seq=0, last_rx=0.0, session_up=False,
+                                         left_tracked=False, right_tracked=False)
+
+    def get_link_status(self) -> XRLinkStatus:
+        """Health of the link that produced the most recent `get_tele_data()`.
+
+        Deliberately paired with that call rather than sampled independently:
+        the safety layer must judge the freshness of the exact payload it is
+        about to act on, not of whatever arrived since.
+        """
+        return self._link_status
+
+    def _update_link_status(self, head_valid, left_valid, right_valid):
+        seq, last_rx, session_up = self.tvuer.xr_liveness_raw
+        # An invalid head pose is silently replaced with CONST_HEAD_POSE upstream.
+        # Since wrist targets are head-relative, fabricated head data poisons both
+        # arms -- so neither side counts as tracked while the head is invalid.
+        self._link_status = XRLinkStatus(
+            seq=seq,
+            last_rx=last_rx,
+            session_up=session_up,
+            left_tracked=bool(left_valid and head_valid),
+            right_tracked=bool(right_valid and head_valid),
+            worn=None,   # the browser transport cannot report presence; Phase 3 can
+        )
+
     def get_tele_data(self):
         """
         Get processed motion state data from the TeleVuer instance.
@@ -363,6 +404,7 @@ class TeleVuerWrapper:
             else:
                 left_Brobot_arm_hand_rot = None
                 right_Brobot_arm_hand_rot = None
+            self._update_link_status(head_pose_is_valid, left_arm_is_valid, right_arm_is_valid)
             return TeleData(
                 head_pose=Brobot_world_head,
                 left_wrist_pose=left_IPunitree_Brobot_wrist_arm,
@@ -409,6 +451,7 @@ class TeleVuerWrapper:
             right_IPunitree_Brobot_wrist_arm[2,3] +=0.45
             # left_IPunitree_Brobot_waist_arm[1, 3] +=0.02 # y
             # right_IPunitree_Brobot_waist_arm[1,3] +=0.02
+            self._update_link_status(head_pose_is_valid, left_arm_is_valid, right_arm_is_valid)
             return TeleData(
                 head_pose=Brobot_world_head,
                 left_wrist_pose=left_IPunitree_Brobot_wrist_arm,
