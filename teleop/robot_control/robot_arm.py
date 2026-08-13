@@ -14,6 +14,11 @@ from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
 import logging_mp
 logger_mp = logging_mp.get_logger(__name__)
 
+try:
+    from teleop.robot_control.arm_safety import ArmSafetyMixin
+except ImportError:  # when this file is run directly as a script
+    from arm_safety import ArmSafetyMixin
+
 kTopicLowCommand_Debug  = "rt/lowcmd"
 kTopicLowCommand_Motion = "rt/arm_sdk"
 kTopicLowState = "rt/lowstate"
@@ -63,7 +68,7 @@ class DataBuffer:
         with self.lock:
             self.data = data
 
-class G1_29_ArmController:
+class G1_29_ArmController(ArmSafetyMixin):
     def __init__(self, motion_mode = False, simulation_mode = False):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.q_target = np.zeros(14)
@@ -343,7 +348,7 @@ class G1_29_JointIndex(IntEnum):
     kNotUsedJoint4 = 33
     kNotUsedJoint5 = 34
 
-class G1_23_ArmController:
+class G1_23_ArmController(ArmSafetyMixin):
     def __init__(self, motion_mode = False, simulation_mode = False):
         self.simulation_mode = simulation_mode
         self.motion_mode = motion_mode
@@ -618,7 +623,7 @@ class G1_23_JointIndex(IntEnum):
     kNotUsedJoint4 = 33
     kNotUsedJoint5 = 34
 
-class H1_2_ArmController:
+class H1_2_ArmController(ArmSafetyMixin):
     def __init__(self, motion_mode = False, simulation_mode = False):
         self.simulation_mode = simulation_mode
         self.motion_mode = motion_mode
@@ -900,7 +905,7 @@ class H1_2_JointIndex(IntEnum):
     kNotUsedJoint6 = 33
     kNotUsedJoint7 = 34
 
-class H1_ArmController:
+class H1_ArmController(ArmSafetyMixin):
     def __init__(self, simulation_mode = False):
         self.simulation_mode = simulation_mode
         
@@ -1120,7 +1125,7 @@ class H1_JointIndex(IntEnum):
     kLeftShoulderYaw = 18
     kLeftElbow = 19
 
-class R1_ArmController:
+class R1_ArmController(ArmSafetyMixin):
     """
     Low-level dual-arm controller for the Unitree R1 humanoid.
 

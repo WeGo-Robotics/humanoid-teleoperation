@@ -58,8 +58,13 @@ G1_NUM_MOTOR = 29
 QPOS_OFFSET = 7        # qpos[0:7] = pelvis free joint; qpos[7:36] = 29 motors
 STAND_Z = 0.79
 
-IPC_DATA_ADDR = "ipc://@xr_teleoperate_data.ipc"
-IPC_HB_ADDR = "ipc://@xr_teleoperate_hb.ipc"
+# The IPC client is shared with the teleop process rather than reimplemented
+# here: the previous local copy lacked heartbeat liveness and reqid correlation,
+# so the UI could not tell a slow reply from a dead peer.
+try:
+    from teleop.utils.ipc import IPC_Client
+except ImportError:      # launched as `python teleop/dashboard.py`
+    from utils.ipc import IPC_Client
 
 # design tokens (from static/dashboard.html, light theme)
 C = {
@@ -653,69 +658,6 @@ class LowStateSource:
 # ----------------------------------------------------------------------------
 # IPC bridge to the teleop process (commands + heartbeat)
 # ----------------------------------------------------------------------------
-class IPCBridge(QObject):
-    heartbeat = pyqtSignal(dict)
-
-    def __init__(self):
-        super().__init__()
-        self._ctx = None
-        self._running = False
-        self.available = False
-
-    def start(self):
-        try:
-            import zmq
-            self._zmq = zmq
-            self._ctx = zmq.Context.instance()
-            self._req = self._ctx.socket(zmq.REQ)
-            self._req.setsockopt(zmq.RCVTIMEO, 500)
-            self._req.setsockopt(zmq.SNDTIMEO, 500)
-            self._req.setsockopt(zmq.LINGER, 0)
-            self._req.connect(IPC_DATA_ADDR)
-            self.available = True
-            self._running = True
-            threading.Thread(target=self._hb_loop, daemon=True).start()
-        except Exception as e:
-            print(f"[IPCBridge] disabled: {e}", file=sys.stderr)
-            self.available = False
-
-    def send_cmd(self, cmd):
-        """Returns (ok, msg). Best-effort; REQ/REP is recreated on timeout."""
-        if not self.available:
-            return False, "IPC 미연결"
-        try:
-            self._req.send_json({"reqid": int(time.time() * 1000) & 0x7fffffff, "cmd": cmd})
-            rep = self._req.recv_json()
-            return rep.get("status") == "ok", rep.get("msg", "")
-        except Exception as e:
-            # REQ socket is now in a bad state after a timeout — rebuild it
-            try:
-                self._req.close(0)
-                self._req = self._ctx.socket(self._zmq.REQ)
-                self._req.setsockopt(self._zmq.RCVTIMEO, 500)
-                self._req.setsockopt(self._zmq.SNDTIMEO, 500)
-                self._req.setsockopt(self._zmq.LINGER, 0)
-                self._req.connect(IPC_DATA_ADDR)
-            except Exception:
-                pass
-            return False, f"응답 없음 ({e})"
-
-    def _hb_loop(self):
-        try:
-            sub = self._ctx.socket(self._zmq.SUB)
-            sub.setsockopt(self._zmq.RCVTIMEO, 500)
-            sub.setsockopt_string(self._zmq.SUBSCRIBE, "")
-            sub.connect(IPC_HB_ADDR)
-        except Exception:
-            return
-        while self._running:
-            try:
-                msg = sub.recv_json()
-                self.heartbeat.emit(msg)
-            except Exception:
-                continue
-
-
 # ----------------------------------------------------------------------------
 # camera view (head camera via ImageClient) — best effort
 # ----------------------------------------------------------------------------
@@ -961,6 +903,9 @@ class Dashboard(QWidget):
 
         self._phase = "off"            # off | starting | ready | running | paused
         self._elapsed = 0
+        self._xr = {}                  # latest safety snapshot from the heartbeat
+        self._align = None             # latest AlignReport dict, or None
+        self.ipc = None                # set below; _build_ui may query it early
         self.proc = None
         self._stop_deadline = None   # time by which the proc group must exit after CMD_STOP
         self.mode_checker = MotionModeChecker()   # robot walking-mode probe (real robot)
@@ -973,6 +918,11 @@ class Dashboard(QWidget):
         self._sec_timer.timeout.connect(self._tick)
         self._proc_timer = QTimer(self)
         self._proc_timer.timeout.connect(self._poll_proc)
+        # Always-on: decays the XR panel when heartbeats stop, so the operator
+        # never sees a stale "all good" after the teleop process has died.
+        self._ui_timer = QTimer(self)
+        self._ui_timer.timeout.connect(self._refresh_xr)
+        self._ui_timer.start(250)
 
         # --- data sources ---
         self.state_src = LowStateSource()
@@ -990,11 +940,19 @@ class Dashboard(QWidget):
         if args.camera:
             self.cam.start()
 
-        self.ipc = IPCBridge()
-        self.ipc.heartbeat.connect(self._on_heartbeat)
-        self.ipc.start()
+        try:
+            self.ipc = IPC_Client()
+        except Exception as e:
+            self.ipc = None
+            print(f"[dashboard] IPC disabled: {e}", file=sys.stderr)
+        # Heartbeats are polled rather than pushed: IPC_Client already keeps the
+        # newest state and its own liveness, so a timer avoids a second thread
+        # marshalling into the Qt event loop.
+        self._hb_timer = QTimer(self)
+        self._hb_timer.timeout.connect(self._poll_heartbeat)
+        self._hb_timer.start(100)
 
-        self._log("대시보드 준비 완료" + ("" if self.ipc.available else " (IPC 미연결)"))
+        self._log("대시보드 준비 완료" + ("" if self.ipc else " (IPC 미연결)"))
 
     # --- ui -----------------------------------------------------------------
     def _build_ui(self):
@@ -1036,6 +994,7 @@ class Dashboard(QWidget):
         sl.setSpacing(20)
 
         sl.addWidget(self._settings_card())
+        sl.addWidget(self._xr_card())
         sl.addWidget(self._status_card())
         sl.addWidget(self._log_card(), 1)
 
@@ -1209,6 +1168,220 @@ class Dashboard(QWidget):
         dlg = DebugWarnDialog(self, self.mode_checker)
         return dlg.exec_() == QDialog.Accepted
 
+    # --- XR headset / safety panel -------------------------------------------
+    # Mirrors the teleop process's SafetyFSM snapshot. This is what tells the
+    # operator *why* 시작 is unavailable, instead of leaving them to guess.
+    XR_SAFETY_LABELS = {
+        "idle": "대기", "following": "추종 중", "hold": "일시 정지(홀드)",
+        "safe_stop": "안전 정지",
+    }
+
+    def _xr_card(self):
+        card = self._card()
+        v = QVBoxLayout(card)
+        v.setContentsMargins(20, 18, 20, 18)
+        v.setSpacing(12)
+
+        row = QHBoxLayout()
+        kicker = QLabel("XR 헤드셋")
+        kicker.setStyleSheet(
+            f"font-size:11px;font-weight:700;letter-spacing:.08em;color:{C['neutral700']};")
+        self.xr_tag = QLabel("—")
+        row.addWidget(kicker)
+        row.addStretch(1)
+        row.addWidget(self.xr_tag)
+        v.addLayout(row)
+
+        self.xr_rows = {}
+        for key, label in (("link", "링크"), ("worn", "착용"),
+                           ("stale", "지연"), ("safety", "안전")):
+            r = QHBoxLayout()
+            lb = QLabel(label)
+            lb.setStyleSheet(f"font-size:12px;color:{C['neutral700']};")
+            val = QLabel("—")
+            val.setStyleSheet(f"font-size:12px;font-weight:600;color:{C['text']};")
+            r.addWidget(lb)
+            r.addStretch(1)
+            r.addWidget(val)
+            v.addLayout(r)
+            self.xr_rows[key] = val
+
+        self.xr_reason = QLabel()
+        self.xr_reason.setWordWrap(True)
+        self.xr_reason.setStyleSheet("font-size:11px;font-weight:600;color:#d64545;")
+        self.xr_reason.setVisible(False)
+        v.addWidget(self.xr_reason)
+
+        # --- start-alignment progress (visible only while aligning) ----------
+        self.align_box = QWidget()
+        self.align_box.setVisible(False)
+        av = QVBoxLayout(self.align_box)
+        av.setContentsMargins(0, 6, 0, 0)
+        av.setSpacing(6)
+        self.align_title = QLabel("정렬 중")
+        self.align_title.setStyleSheet(
+            f"font-size:12px;font-weight:700;color:{C['accent']};")
+        av.addWidget(self.align_title)
+        self.align_reason = QLabel()
+        self.align_reason.setWordWrap(True)
+        self.align_reason.setStyleSheet(f"font-size:11px;color:{C['neutral700']};")
+        av.addWidget(self.align_reason)
+        self.align_bar = QFrame()
+        self.align_bar.setFixedHeight(6)
+        self.align_bar.setStyleSheet(
+            f"QFrame{{background:{C['divider']};border-radius:3px;}}")
+        self.align_fill = QFrame(self.align_bar)
+        self.align_fill.setGeometry(0, 0, 0, 6)
+        self.align_fill.setStyleSheet(
+            f"QFrame{{background:{C['accent']};border-radius:3px;}}")
+        av.addWidget(self.align_bar)
+        self.align_err = QLabel()
+        self.align_err.setStyleSheet(
+            "font-size:11px;font-family:monospace;color:#6b6b66;")
+        av.addWidget(self.align_err)
+        self.btn_align_cancel = self._btn("정렬 취소")
+        self.btn_align_cancel.clicked.connect(self._on_cancel_align)
+        av.addWidget(self.btn_align_cancel)
+        v.addWidget(self.align_box)
+
+        self.btn_ack = self._btn("안전정지 해제")
+        self.btn_ack.setEnabled(False)
+        self.btn_ack.setToolTip("래치된 안전 정지를 해제합니다 (해제 후 [시작] 가능)")
+        self.btn_ack.clicked.connect(self._on_ack)
+        v.addWidget(self.btn_ack)
+
+        self._set_xr_tag(None)
+        return card
+
+    def _set_xr_tag(self, ok, text=None):
+        if text is None:
+            text = {True: "정상", False: "주의", None: "미연결"}[ok]
+        bg = {True: "#1f9d55", False: "#d64545", None: C["divider"]}[ok]
+        fg = C["neutral700"] if ok is None else "#fff"
+        self.xr_tag.setText(text)
+        self.xr_tag.setStyleSheet(
+            f"font-size:11px;font-weight:700;padding:4px 10px;border-radius:10px;"
+            f"background:{bg};color:{fg};")
+
+    def _send_cmd(self, cmd, require_online=True):
+        """Send an IPC command. Returns (ok, message)."""
+        if self.ipc is None:
+            return False, "IPC 미연결"
+        rep = self.ipc.send_data(cmd, require_online=require_online)
+        return rep.get("status") == "ok", rep.get("msg", "")
+
+    def _poll_heartbeat(self):
+        if self.ipc is None:
+            return
+        state = self.ipc.latest_state()
+        if state:
+            self._on_heartbeat(state)
+        else:
+            self._refresh_xr()   # nothing arriving -> let the panel decay
+
+    def _hb_fresh(self):
+        """Heartbeats arrive at 10Hz; treat a 1.5s gap as telemetry lost.
+
+        Without this the panel would keep displaying the last known-good XR
+        state after the teleop process dies -- the exact moment it must not be
+        trusted."""
+        return self.ipc is not None and self.ipc.heartbeat_age() < 1.5
+
+    def _refresh_xr(self):
+        xr = self._xr
+        if not xr or not self._hb_fresh():
+            self._refresh_align(None)
+            for val in self.xr_rows.values():
+                val.setText("—")
+            self.xr_reason.setVisible(False)
+            self.btn_ack.setEnabled(False)
+            self._set_xr_tag(None)
+            self._apply_button_state()
+            return
+
+        link_up = bool(xr.get("link_up"))
+        worn = xr.get("worn")
+        state = xr.get("state") or "—"
+        latched = bool(xr.get("latched"))
+
+        self.xr_rows["link"].setText("연결됨" if link_up else "끊김")
+        self.xr_rows["worn"].setText(
+            {True: "착용 중", False: "벗음", None: "알 수 없음"}.get(worn, "알 수 없음"))
+        self.xr_rows["stale"].setText(f"{int(xr.get('stale_ms', 0))} ms")
+        self.xr_rows["safety"].setText(self.XR_SAFETY_LABELS.get(state, state))
+
+        reason = xr.get("reason") or ""
+        self.xr_reason.setText(reason)
+        self.xr_reason.setVisible(bool(reason))
+        self.btn_ack.setEnabled(latched)
+
+        if latched:
+            self._set_xr_tag(False, "안전 정지")
+        elif not link_up:
+            self._set_xr_tag(False, "링크 끊김")
+        elif worn is False:
+            self._set_xr_tag(False, "미착용")
+        elif state == "hold":
+            self._set_xr_tag(False, "홀드")
+        else:
+            self._set_xr_tag(True)
+        self._apply_button_state()
+
+    def _xr_block_reason(self):
+        """Why 시작 is unavailable, or None if it is fine to start."""
+        if not self._hb_fresh():
+            return "텔레옵 상태 수신 없음"
+        xr = self._xr
+        if not xr:
+            return "XR 상태 미수신"
+        if xr.get("latched"):
+            return "안전 정지 래치됨 — [안전정지 해제] 후 시작"
+        if not xr.get("link_up"):
+            return "헤드셋 링크 끊김"
+        if xr.get("worn") is False:
+            return "헤드셋 미착용"
+        return None
+
+    def _refresh_align(self, align):
+        """Render the start-alignment gate. `align` is None when not aligning."""
+        if not align or not self._hb_fresh():
+            self.align_box.setVisible(False)
+            return
+        self.align_box.setVisible(True)
+        self.align_reason.setText(align.get("reason", ""))
+
+        progress = float(align.get("progress", 0.0) or 0.0)
+        self.align_fill.setGeometry(
+            0, 0, int(self.align_bar.width() * max(0.0, min(1.0, progress))), 6)
+
+        def fmt(pos, rot):
+            if pos is None or rot is None:
+                return "  --"
+            return f"{pos * 100:5.1f}cm {rot:5.1f}°"
+        self.align_err.setText(
+            f"L {fmt(align.get('left_pos_err'), align.get('left_rot_err'))}\n"
+            f"R {fmt(align.get('right_pos_err'), align.get('right_rot_err'))}")
+
+        ok = bool(align.get("within_tolerance"))
+        self.align_title.setText("정렬 확인됨 — 확정 대기" if ok else "정렬 중")
+        self.align_title.setStyleSheet(
+            f"font-size:12px;font-weight:700;"
+            f"color:{'#1f9d55' if ok else C['accent']};")
+
+    def _on_cancel_align(self):
+        ok, msg = self._send_cmd("CMD_CANCEL_ALIGN")
+        self._log(f"[IPC] CMD_CANCEL_ALIGN -> {'ok' if ok else msg}")
+
+    def _on_ack(self):
+        ok, msg = self._send_cmd("CMD_ACK_FAULT")
+        self._log(f"[IPC] CMD_ACK_FAULT -> {'ok' if ok else msg}")
+
+    def _on_estop(self):
+        ok, msg = self._send_cmd("CMD_ESTOP", require_online=False)
+        self._log(f"[IPC] CMD_ESTOP -> {'ok' if ok else msg}")
+        self._sec_timer.stop()
+        self._set_tag(False, "비상 정지")
+
     def _status_card(self):
         card = self._card()
         v = QVBoxLayout(card)
@@ -1252,6 +1425,17 @@ class Dashboard(QWidget):
         row2.addWidget(self.btn_start); row2.addWidget(self.btn_pause)
         v.addLayout(row1)
         v.addLayout(row2)
+
+        self.btn_estop = QPushButton("비상 정지")
+        self.btn_estop.setCursor(Qt.PointingHandCursor)
+        self.btn_estop.setStyleSheet(
+            "QPushButton{background:#d64545;color:#fff;border:none;border-radius:8px;"
+            "padding:11px 12px;font-size:13px;font-weight:700;}"
+            "QPushButton:hover{background:#bf3a3a;}"
+            f"QPushButton:disabled{{color:#aaa;background:{C['divider']};}}")
+        self.btn_estop.clicked.connect(self._on_estop)
+        v.addWidget(self.btn_estop)
+
         self._apply_button_state()
         return card
 
@@ -1317,9 +1501,17 @@ class Dashboard(QWidget):
     def _apply_button_state(self):
         p = self._phase
         self.btn_launch.setEnabled(p == "off")
-        self.btn_start.setEnabled(p in ("ready", "paused"))
+        # 시작 additionally requires a live headset link with the operator wearing
+        # it and no latched fault -- the operator should never be able to start
+        # following into a headset that is not there.
+        blocked = self._xr_block_reason()
+        phase_ok = p in ("ready", "paused")
+        self.btn_start.setEnabled(phase_ok and blocked is None)
+        self.btn_start.setToolTip(blocked if (phase_ok and blocked) else "")
         self.btn_pause.setEnabled(p == "running")
         self.btn_stop.setEnabled(p != "off")
+        if hasattr(self, "btn_estop"):
+            self.btn_estop.setEnabled(p not in ("off",))
         # settings are launch-time args -> body editable only before launch.
         # header stays clickable so the panel can still be expanded to view them.
         if hasattr(self, "settings_body"):
@@ -1374,7 +1566,7 @@ class Dashboard(QWidget):
         if self._phase not in ("ready", "paused"):
             return
         resuming = self._phase == "paused"
-        ok, msg = self.ipc.send_cmd("CMD_START")
+        ok, msg = self._send_cmd("CMD_START")
         self._log(f"[IPC] CMD_START -> {'ok' if ok else msg}")
         if not ok:
             return
@@ -1387,7 +1579,7 @@ class Dashboard(QWidget):
     def _on_pause(self):
         if self._phase != "running":
             return
-        ok, msg = self.ipc.send_cmd("CMD_PAUSE")
+        ok, msg = self._send_cmd("CMD_PAUSE")
         self._log(f"[IPC] CMD_PAUSE -> {'ok' if ok else msg}")
         if not ok:
             return
@@ -1399,7 +1591,7 @@ class Dashboard(QWidget):
     def _on_stop(self):
         if self._phase == "off":
             return
-        ok, msg = self.ipc.send_cmd("CMD_STOP")
+        ok, msg = self._send_cmd("CMD_STOP", require_online=False)
         self._log(f"[IPC] CMD_STOP -> {'ok' if ok else msg}")
         self._sec_timer.stop()
         self._elapsed = 0
@@ -1414,6 +1606,19 @@ class Dashboard(QWidget):
         self.time_lbl.setText(f"{self._elapsed // 60:02d}:{self._elapsed % 60:02d}")
 
     def _on_heartbeat(self, hb):
+        # XR telemetry first: it stays meaningful even in phases where the
+        # phase machine below bails out early.
+        xr = hb.get("XR")
+        if isinstance(xr, dict):
+            if xr.get("latched") and not self._xr.get("latched"):
+                self._log(f"🛑 안전 정지 — {xr.get('reason', '')}")
+            elif xr.get("state") == "hold" and self._xr.get("state") != "hold":
+                self._log(f"⏸️ 홀드 — {xr.get('reason', '')}")
+            self._xr = xr
+            self._refresh_xr()
+        self._align = hb.get("ALIGN")
+        self._refresh_align(self._align)
+
         # teleop heartbeat is authoritative for readiness/following
         if self._phase == "off":
             return
@@ -1512,7 +1717,7 @@ class Dashboard(QWidget):
         # shut down teleop process group if we launched it
         if self.proc and self.proc.poll() is None:
             try:
-                self.ipc.send_cmd("CMD_STOP")
+                self._send_cmd("CMD_STOP", require_online=False)
                 self.proc.wait(timeout=5)
             except Exception:
                 # graceful exit failed -> SIGTERM the group, then SIGKILL
@@ -1521,6 +1726,19 @@ class Dashboard(QWidget):
                     self.proc.wait(timeout=3)
                 except Exception:
                     self._kill_proc_group(signal.SIGKILL)
+        # Stop polling before tearing the client down, so a timer callback
+        # cannot land on a half-closed socket.
+        for timer in ("_hb_timer", "_ui_timer", "_sec_timer", "_proc_timer"):
+            try:
+                getattr(self, timer).stop()
+            except Exception:
+                pass
+        if self.ipc is not None:
+            try:
+                self.ipc.stop()
+            except Exception:
+                pass
+            self.ipc = None
         super().closeEvent(e)
 
 
