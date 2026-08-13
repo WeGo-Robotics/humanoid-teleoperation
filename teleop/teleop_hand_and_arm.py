@@ -20,6 +20,9 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.safety import (Action, SafetyConfig, SafetyFSM, XRLiveness)
+from teleop.safety.align import AlignConfig, AlignGate
+from teleop.xr import XRFrame
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -37,6 +40,8 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 PAUSE_REQUEST  = False  # One-shot: on pause, return arms to home then hold (following stays off)
+SAFETY         = None   # SafetyFSM, built during startup; gates every arm command
+ALIGN_STATE    = None   # latest AlignReport.as_dict(), or None when not aligning
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -50,7 +55,7 @@ PAUSE_REQUEST  = False  # One-shot: on pause, return arms to home then hold (fol
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE, PAUSE_REQUEST
+    global STOP, START, RECORD_TOGGLE, PAUSE_REQUEST, SAFETY
     if key == 'r':
         START = True
     elif key == 'p':
@@ -63,18 +68,39 @@ def on_press(key):
         STOP = True
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
+    elif key == 'a':
+        # acknowledge a latched safety stop. This is the only way out of
+        # SAFE_STOP -- deliberately a separate, explicit operator action.
+        if SAFETY is not None and SAFETY.acknowledge(time.monotonic()):
+            logger_mp.info("✅ safety fault acknowledged — [r] to re-arm")
+        else:
+            logger_mp.warning("[on_press] nothing to acknowledge")
+    elif key == 'e':
+        # operator emergency stop
+        if SAFETY is not None:
+            SAFETY.estop(time.monotonic(), "keyboard")
+        START = False
+    elif key == 'c':
+        # cancel an alignment in progress (same effect as never having started)
+        if START:
+            START = False
+            logger_mp.info("alignment cancelled")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
 def get_state() -> dict:
     """Return current heartbeat state"""
-    global START, STOP, RECORD_RUNNING, READY
-    return {
+    global START, STOP, RECORD_RUNNING, READY, SAFETY, ALIGN_STATE
+    state = {
         "START": START,
         "STOP": STOP,
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
     }
+    # XR link + safety telemetry, rendered by the dashboard's headset panel.
+    state["XR"] = SAFETY.snapshot() if SAFETY is not None else None
+    state["ALIGN"] = ALIGN_STATE
+    return state
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -92,6 +118,32 @@ if __name__ == '__main__':
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
+    # xr safety gate (see docs/xr_automation_and_safety_plan.md)
+    parser.add_argument('--xr-stale-ms', type = float, default = 200.0,
+                        help = 'No XR pose event for this long -> hold the arms')
+    parser.add_argument('--xr-dead-ms', type = float, default = 1000.0,
+                        help = 'No XR pose event for this long -> latched safe stop')
+    parser.add_argument('--safe-stop-home', action = 'store_true', default = True,
+                        help = 'On a safe stop, return the arms home slowly (default on)')
+    parser.add_argument('--no-safe-stop-home', dest = 'safe_stop_home', action = 'store_false',
+                        help = 'On a safe stop, freeze the arms in place and do not home them')
+    parser.add_argument('--xr-source', type = str, choices = ['vuer', 'xrlink'], default = 'vuer',
+                        help = 'XR transport: vuer (browser, default) or xrlink (native app)')
+    parser.add_argument('--xrlink-port', type = int, default = 8443,
+                        help = 'XrLink websocket port when --xr-source=xrlink')
+    # start-alignment gate
+    parser.add_argument('--align-pos-tol', type = float, default = 0.10,
+                        help = 'Per-wrist position tolerance for the start-alignment gate (m)')
+    parser.add_argument('--align-rot-tol', type = float, default = 25.0,
+                        help = 'Per-wrist orientation tolerance for the start-alignment gate (deg)')
+    parser.add_argument('--align-hold', type = float, default = 2.0,
+                        help = 'Seconds the operator must hold the confirm gesture in position')
+    parser.add_argument('--skip-align', action = 'store_true',
+                        help = 'DANGEROUS. Skip the start-alignment gate; following begins '
+                               'from whatever pose the operator is in.')
+    parser.add_argument('--disable-xr-safety', action = 'store_true',
+                        help = 'DANGEROUS. Bench/bringup only: run without the XR safety '
+                               'gate, so losing the headset will NOT stop the robot.')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
@@ -104,6 +156,29 @@ if __name__ == '__main__':
     logger_mp.info(f"args: {args}")
 
     motion_switcher = None   # set in debug mode; used to restore ai mode on exit
+
+    # XR safety gate. Nothing reaches the arms without its verdict.
+    safety_cfg = SafetyConfig()
+    safety_cfg.watchdog.stale_s = args.xr_stale_ms / 1000.0
+    safety_cfg.watchdog.dead_s = args.xr_dead_ms / 1000.0
+    SAFETY = SafetyFSM(safety_cfg,
+                       on_event=lambda level, msg: getattr(logger_mp, level, logger_mp.info)(msg))
+    if args.disable_xr_safety:
+        logger_mp.error("=" * 70)
+        logger_mp.error("⚠️  XR SAFETY GATE DISABLED (--disable-xr-safety)")
+        logger_mp.error("⚠️  Removing the headset will NOT stop the robot. Bench use only.")
+        logger_mp.error("=" * 70)
+
+    # Start-alignment gate: the operator's wrists must match the robot's own,
+    # verified from robot state, before following can begin.
+    ALIGN = AlignGate(AlignConfig(pos_tol_m=args.align_pos_tol,
+                                  rot_tol_deg=args.align_rot_tol,
+                                  hold_s=args.align_hold))
+    if args.skip_align:
+        logger_mp.error("=" * 70)
+        logger_mp.error("⚠️  START-ALIGNMENT GATE SKIPPED (--skip-align)")
+        logger_mp.error("⚠️  The arms will jump to your pose the instant you start.")
+        logger_mp.error("=" * 70)
 
     try:
         # setup dds communication domains id
@@ -129,19 +204,35 @@ if __name__ == '__main__':
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
-        # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
-        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
-                                     binocular=camera_config['head_camera']['binocular'],
-                                     img_shape=camera_config['head_camera']['image_shape'],
-                                     # maybe should decrease fps for better performance?
-                                     # https://github.com/unitreerobotics/xr_teleoperate/issues/172
-                                     # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
-                                     display_mode=args.display_mode,
-                                     zmq=camera_config['head_camera']['enable_zmq'],
-                                     webrtc=camera_config['head_camera']['enable_webrtc'],
-                                     webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
-                                     )
-        
+        # XR source. Everything below this point talks to `xr`, never to a
+        # specific device -- see teleop/xr. Swapping the browser transport for
+        # the native app is this one branch.
+        if args.xr_source == "xrlink":
+            from teleop.xr.link_server import XrLinkServer
+            from teleop.xr.native_source import NativeXRSource
+            link = XrLinkServer(port=args.xrlink_port,
+                                on_estop=lambda: SAFETY.estop(time.monotonic(), "device"))
+            if not link.start():
+                raise RuntimeError("XrLink server failed to start")
+            xr = NativeXRSource(link)
+            tv_wrapper = None
+        else:
+            from teleop.xr.vuer_source import VuerXRSource
+            # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
+            tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand",
+                                         binocular=camera_config['head_camera']['binocular'],
+                                         img_shape=camera_config['head_camera']['image_shape'],
+                                         # maybe should decrease fps for better performance?
+                                         # https://github.com/unitreerobotics/xr_teleoperate/issues/172
+                                         # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
+                                         display_mode=args.display_mode,
+                                         zmq=camera_config['head_camera']['enable_zmq'],
+                                         webrtc=camera_config['head_camera']['enable_webrtc'],
+                                         webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+                                         )
+            xr = VuerXRSource(tv_wrapper, use_hand_tracking=args.input_mode == "hand")
+        logger_mp.info(f"XR source: {xr.name}")
+
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
             if args.input_mode == "controller":
@@ -257,19 +348,63 @@ if __name__ == '__main__':
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
+        logger_mp.info("🟠  Press [e] for an emergency stop, [a] to acknowledge a safety fault.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
+            # Keep the safety telemetry live while idle so the dashboard can show
+            # headset link state and refuse to arm until the operator is present.
+            _idle = xr.read()
+            SAFETY.update(time.monotonic(), _idle.liveness, _idle.head_pose,
+                          _idle.left_wrist_pose, _idle.right_wrist_pose)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img, _ = img_client.get_head_frame()
-                tv_wrapper.render_to_xr(head_img)
+                xr.render_to_xr(head_img)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
-        arm_ctrl.speed_gradual_max()
+        was_following = False
+        aligning = False
+        _last_unsafe_warn = 0.0
+        _last_align_push = 0.0
+        _fk_warned = False
+
+        def _begin_following():
+            """Common entry into FOLLOWING: fresh baselines and a fresh ramp."""
+            arm_ctrl.release_hold()
+            arm_ctrl.restore_velocity_limit()
+            arm_ctrl.speed_gradual_max()
+            logger_mp.info("▶️  following armed")
+
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
+
+            # --- START edge: enter ALIGNMENT, not following -------------------
+            # Every entry into following goes through alignment, so a resume
+            # after a pause or a fault is re-verified exactly like a cold start.
+            # There is no path that silently resumes motion.
+            if START and not was_following and not aligning:
+                if SAFETY.latched and not args.disable_xr_safety:
+                    START = False
+                    logger_mp.error("⛔ cannot start — safety fault latched. Press [a] to acknowledge.")
+                elif args.skip_align:
+                    if SAFETY.arm(time.monotonic()) or args.disable_xr_safety:
+                        _begin_following()
+                        was_following = True
+                    else:
+                        START = False
+                else:
+                    aligning = True
+                    ALIGN.reset(time.monotonic())
+                    logger_mp.info("🧍 alignment — match the robot's arm pose, then "
+                                   "hold both pinches/triggers. [c] to cancel.")
+            elif not START and (was_following or aligning):
+                SAFETY.disarm(time.monotonic())
+                was_following = False
+                if aligning:
+                    aligning = False
+                    ALIGN_STATE = None
 
             # paused: stop following, return arms home once, then hold (loop stays alive)
             if not START:
@@ -284,10 +419,15 @@ if __name__ == '__main__':
                 # keep robot base still while paused
                 if args.input_mode == "controller" and args.motion:
                     loco_wrapper.Move(0, 0, 0)
+                # keep XR telemetry live while paused so the dashboard can show
+                # headset presence and decide whether 시작 may be offered
+                _idle = xr.read()
+                SAFETY.update(time.monotonic(), _idle.liveness, _idle.head_pose,
+                              _idle.left_wrist_pose, _idle.right_wrist_pose)
                 # keep feeding the XR head image while paused
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                     head_img, _ = img_client.get_head_frame()
-                    tv_wrapper.render_to_xr(head_img)
+                    xr.render_to_xr(head_img)
                 time.sleep(max(0, (1 / args.frequency) - (time.time() - start_time)))
                 continue
 
@@ -296,7 +436,7 @@ if __name__ == '__main__':
                 if args.record or xr_need_local_img:
                     head_img, head_img_fps = img_client.get_head_frame()
                 if xr_need_local_img:
-                    tv_wrapper.render_to_xr(head_img)
+                    xr.render_to_xr(head_img)
             #if camera_config['left_wrist_camera']['enable_zmq']:
             #    if args.record:
             #        left_wrist_img, _ = img_client.get_left_wrist_frame()
@@ -318,39 +458,131 @@ if __name__ == '__main__':
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
 
-            # get xr's tele data
-            tele_data = tv_wrapper.get_tele_data()
+            # get xr's tele data (device-neutral; see teleop/xr)
+            frame = xr.read()
+            left_target, right_target = frame.left_wrist_pose, frame.right_wrist_pose
+
+            # -------------------- START-ALIGNMENT GATE ------------------------
+            # The arms stay frozen here. Following begins only once the host
+            # agrees (FK of the robot's own joints matches the operator's wrists)
+            # AND the operator agrees (two-handed gesture), both held together.
+            if aligning:
+                arm_ctrl.hold()
+                robot_l, robot_r = arm_ik.forward_kinematics(
+                    arm_ctrl.get_current_dual_arm_q())
+                if robot_l is None and not _fk_warned:
+                    # Without FK the gate can never pass, and the operator would
+                    # otherwise just see alignment hang until it times out.
+                    _fk_warned = True
+                    logger_mp.error("⛔ forward kinematics unavailable — alignment "
+                                    "cannot be verified and will not pass. Fix the "
+                                    "IK model, or use --skip-align at your own risk.")
+                report = ALIGN.update(time.monotonic(), robot_l, robot_r,
+                                      frame.left_wrist_pose, frame.right_wrist_pose,
+                                      frame.confirm_gesture)
+                ALIGN_STATE = report.as_dict()
+
+                # Mirror progress into the headset where the transport allows it
+                # (native only; the browser transport is receive-only).
+                if start_time - _last_align_push >= 0.1:
+                    _last_align_push = start_time
+                    xr.send({"t": "state", "session": "ALIGN",
+                             "reason": report.reason,
+                             "align": ALIGN_STATE})
+
+                if report.accepted:
+                    aligning = False
+                    ALIGN_STATE = None
+                    if SAFETY.arm(time.monotonic()) or args.disable_xr_safety:
+                        _begin_following()
+                        was_following = True
+                        logger_mp.info("✅ aligned — following")
+                    else:
+                        START = False
+                elif report.timed_out:
+                    aligning = False
+                    ALIGN_STATE = None
+                    START = False
+                    logger_mp.warning("⌛ alignment timed out — not started")
+                else:
+                    if args.input_mode == "controller" and args.motion:
+                        loco_wrapper.Move(0, 0, 0)
+                    time.sleep(max(0, (1 / args.frequency) - (time.time() - start_time)))
+                    continue
+            # ------------------------------------------------------------------
+
+            # ---------------------- XR SAFETY GATE ----------------------------
+            # Placed before the end-effector arrays, the locomotion commands and
+            # the IK, so a fault freezes the hands and the base too -- not just
+            # the arms. Nothing below this point runs on untrusted XR data.
+            verdict = SAFETY.update(time.monotonic(), frame.liveness,
+                                    frame.head_pose,
+                                    frame.left_wrist_pose,
+                                    frame.right_wrist_pose)
+            if args.disable_xr_safety:
+                if start_time - _last_unsafe_warn >= 10.0:
+                    _last_unsafe_warn = start_time
+                    logger_mp.warning("⚠️  XR safety gate is DISABLED "
+                                      f"(would be: {verdict.action.value} {verdict.reason})")
+            elif verdict.action is Action.SAFE_STOP:
+                logger_mp.error(f"🛑 SAFE STOP — {verdict.reason}")
+                START = False
+                was_following = False
+                if args.input_mode == "controller" and args.motion:
+                    loco_wrapper.Move(0, 0, 0)
+                arm_ctrl.safe_stop(go_home=args.safe_stop_home)
+                if RECORD_RUNNING:
+                    # Deliberately not auto-saved: an episode that ends in a
+                    # fault is usually not a demonstration worth keeping, and
+                    # that is the operator's call, not ours.
+                    logger_mp.warning("🛑 recording is still open — [s] to save, or discard it")
+                logger_mp.error("🛑 following latched off. Press [a] to acknowledge, then [r].")
+                continue
+            elif verdict.action is Action.HOLD:
+                # The head image was already pushed to the headset earlier this
+                # cycle, so the operator keeps seeing a live feed while held.
+                arm_ctrl.hold()
+                if args.input_mode == "controller" and args.motion:
+                    loco_wrapper.Move(0, 0, 0)
+                time.sleep(max(0, (1 / args.frequency) - (time.time() - start_time)))
+                continue
+            else:
+                # PASS: use the rate-limited targets, never the raw XR poses.
+                arm_ctrl.release_hold()
+                left_target, right_target = verdict.left_wrist, verdict.right_wrist
+            # ------------------------------------------------------------------
+
             if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
-                    left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
+                    left_hand_pos_array[:] = frame.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
-                    right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+                    right_hand_pos_array[:] = frame.right_hand_pos.flatten()
             elif args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
-                    left_gripper_value.value = tele_data.left_ctrl_triggerValue
+                    left_gripper_value.value = frame.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
-                    right_gripper_value.value = tele_data.right_ctrl_triggerValue
+                    right_gripper_value.value = frame.right_ctrl_triggerValue
             elif args.ee == "dex1" and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
-                    left_gripper_value.value = tele_data.left_hand_pinchValue
+                    left_gripper_value.value = frame.left_hand_pinchValue
                 with right_gripper_value.get_lock():
-                    right_gripper_value.value = tele_data.right_hand_pinchValue
+                    right_gripper_value.value = frame.right_hand_pinchValue
             else:
                 pass
             
             # high level control
             if args.input_mode == "controller" and args.motion:
                 # quit teleoperate
-                if tele_data.right_ctrl_aButton:
+                if frame.right_ctrl_aButton:
                     START = False
                     STOP = True
                 # command robot to enter damping mode. soft emergency stop function
-                if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
+                if frame.left_ctrl_thumbstick and frame.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                                  -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                                  -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
+                loco_wrapper.Move(-frame.left_ctrl_thumbstickValue[1] * 0.3,
+                                  -frame.left_ctrl_thumbstickValue[0] * 0.3,
+                                  -frame.right_ctrl_thumbstickValue[0]* 0.3)
 
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
@@ -358,7 +590,7 @@ if __name__ == '__main__':
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+            sol_q, sol_tauff  = arm_ik.solve_ik(left_target, right_target, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
@@ -390,9 +622,9 @@ if __name__ == '__main__':
                         left_hand_action = [dual_gripper_action_array[0]]
                         right_hand_action = [dual_gripper_action_array[1]]
                         current_body_state = arm_ctrl.get_current_motor_q().tolist()
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
+                        current_body_action = [-frame.left_ctrl_thumbstickValue[1]  * 0.3,
+                                               -frame.left_ctrl_thumbstickValue[0]  * 0.3,
+                                               -frame.right_ctrl_thumbstickValue[0] * 0.3]
                 elif (args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                     with dual_hand_data_lock:
                         left_ee_state = dual_hand_state_array[:6]
@@ -517,6 +749,15 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
+            # A prior safe stop leaves the velocity ceiling at SAFE_ARM_VELOCITY.
+            # ctrl_dual_arm_go_home() gives up after ~5s, so leaving it there
+            # would strand the arms part-way through the exit move.
+            arm_ctrl.release_hold()
+            arm_ctrl.restore_velocity_limit()
+        except Exception as e:
+            logger_mp.error(f"Failed to restore arm velocity limit: {e}")
+
+        try:
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
@@ -536,7 +777,7 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close image client: {e}")
 
         try:
-            tv_wrapper.close()
+            xr.close()
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
