@@ -49,6 +49,9 @@ SCENARIOS = {
     "untracked": "Report both hands untracked while still streaming.",
     "estop": "Stream, then send an estop control message.",
     "confirm": "Stream with the confirm gesture held, for the align gate.",
+    "buttons": "Stream, then hold both thumbstick clicks (damp), release, "
+               "then press right A (quit). Exercises the control-channel "
+               "button path -- only visible with --motion on the host.",
 }
 
 
@@ -170,22 +173,64 @@ class FakeQuest:
             await ws.send(json.dumps({"t": "estop"}))
             await self._stream(ws, duration, "post-estop")
 
+        elif scenario == "buttons":
+            # Level-triggered, exactly as the app sends it: each message is the
+            # complete held set, and releasing means sending an empty one.
+            await self._buttons(ws, ["left_thumb", "right_thumb"], "damp")
+            await self._stream(ws, 2.0, "damping")
+            await self._buttons(ws, [], "release")
+            await self._stream(ws, 1.0, "released")
+            await self._buttons(ws, ["right_a"], "quit")
+            await self._stream(ws, duration, "post-quit")
+
         else:
             raise SystemExit(f"unknown scenario: {scenario}")
 
+    async def _buttons(self, ws, pressed, label):
+        print(f"[fake-quest] >>> buttons {label}: {pressed or '(none)'}")
+        await ws.send(json.dumps({"t": "buttons", "pressed": pressed}))
+
     async def _stream(self, ws, seconds, label):
+        """Stream at RATE_HZ on an absolute schedule.
+
+        Two Windows-specific traps are avoided here, and both of them silently
+        turn this tool into a flood rather than a headset:
+
+        `time.monotonic()` has 15.6ms granularity on Windows (it is
+        GetTickCount64 before Python 3.13). asyncio fires any timer due within
+        one clock resolution, so `await asyncio.sleep(1/72)` returns
+        *immediately* once the event loop has other work -- which it does, as
+        soon as a websocket is attached. Measured: ~10,000 frames a second
+        instead of 72. `perf_counter` is high-resolution everywhere, so the
+        deadline is computed from it and the sleep is re-checked against it.
+
+        Pacing is absolute rather than `sleep(period)` per frame, so a slow send
+        does not push every later frame back and quietly lower the rate.
+        """
         period = 1.0 / RATE_HZ
-        end = time.monotonic() + seconds
+        start = time.perf_counter()
+        end = start + seconds
         sent = 0
-        while time.monotonic() < end:
+        while time.perf_counter() < end:
             try:
                 await ws.send(self.payload())
             except Exception as e:
                 print(f"[fake-quest] send failed ({e!r}) — link is down")
                 return
             sent += 1
-            await asyncio.sleep(period)
-        print(f"[fake-quest] {label}: sent {sent} frames")
+
+            target = start + sent * period
+            while True:
+                remaining = target - time.perf_counter()
+                if remaining <= 0:
+                    break
+                # Long waits can use a real timer; short ones become a yield
+                # loop, because on Windows asyncio cannot represent them.
+                await asyncio.sleep(remaining if remaining > 0.05 else 0)
+
+        elapsed = time.perf_counter() - start
+        print(f"[fake-quest] {label}: sent {sent} frames "
+              f"({sent / max(elapsed, 1e-6):.0f} Hz)")
 
     async def _log_incoming(self, ws):
         try:

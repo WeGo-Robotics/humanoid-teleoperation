@@ -366,8 +366,10 @@ if __name__ == '__main__':
         was_following = False
         aligning = False
         _last_unsafe_warn = 0.0
-        _last_align_push = 0.0
         _fk_warned = False
+
+        _last_state_push = 0.0
+        _last_state_key = None
 
         def _begin_following():
             """Common entry into FOLLOWING: fresh baselines and a fresh ramp."""
@@ -375,6 +377,39 @@ if __name__ == '__main__':
             arm_ctrl.restore_velocity_limit()
             arm_ctrl.speed_gradual_max()
             logger_mp.info("▶️  following armed")
+
+        def _session_label():
+            """(session, reason) as the headset should display it."""
+            snap = SAFETY.snapshot()
+            if snap["latched"]:
+                return "SAFE_STOP", snap["reason"]
+            if not was_following:
+                return "IDLE", "" if snap["link_up"] else snap["reason"]
+            return snap["state"].upper(), snap["reason"]
+
+        def _push_device_state(now, session, reason="", align=None,
+                               min_interval=0.5):
+            """Mirror the host's view of the session into the headset.
+
+            The operator in passthrough can see the robot but not *why* it
+            stopped -- the terminal log is on the host and they are wearing a
+            headset. This is the only channel that tells them, so it covers the
+            whole session and not just alignment.
+
+            Sends immediately on change, then repeats at `min_interval` as a
+            keepalive so a headset that reconnects mid-session does not sit on a
+            blank HUD until the next transition. No-ops on the Vuer path, where
+            the transport is receive-only.
+            """
+            global _last_state_push, _last_state_key
+            key = (session, reason)
+            if key == _last_state_key and (now - _last_state_push) < min_interval:
+                return
+            _last_state_push, _last_state_key = now, key
+            msg = {"t": "state", "session": session, "reason": reason}
+            if align is not None:
+                msg["align"] = align
+            xr.send(msg)
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -462,6 +497,10 @@ if __name__ == '__main__':
             frame = xr.read()
             left_target, right_target = frame.left_wrist_pose, frame.right_wrist_pose
 
+            # Alignment pushes its own richer message below, including progress.
+            if not aligning:
+                _push_device_state(start_time, *_session_label())
+
             # -------------------- START-ALIGNMENT GATE ------------------------
             # The arms stay frozen here. Following begins only once the host
             # agrees (FK of the robot's own joints matches the operator's wrists)
@@ -483,12 +522,11 @@ if __name__ == '__main__':
                 ALIGN_STATE = report.as_dict()
 
                 # Mirror progress into the headset where the transport allows it
-                # (native only; the browser transport is receive-only).
-                if start_time - _last_align_push >= 0.1:
-                    _last_align_push = start_time
-                    xr.send({"t": "state", "session": "ALIGN",
-                             "reason": report.reason,
-                             "align": ALIGN_STATE})
+                # (native only; the browser transport is receive-only). Faster
+                # than the ordinary keepalive because the operator is watching a
+                # progress bar and adjusting their stance against it.
+                _push_device_state(start_time, "ALIGN", report.reason,
+                                   align=ALIGN_STATE, min_interval=0.1)
 
                 if report.accepted:
                     aligning = False
