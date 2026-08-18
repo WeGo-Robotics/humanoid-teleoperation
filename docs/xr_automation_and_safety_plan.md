@@ -979,7 +979,11 @@ protocol version, magic number, frame sizes, button vocabulary, and that the HUD
 can send rather than letting a new one render as "nothing in particular".
 
 **Not verified: any of it on a headset.** No Quest has run this APK. The handedness flip, the presence timing, the
-passthrough setup and the HUD placement are all unexercised. §12.6 lists handedness first for a reason — if the arms
+passthrough setup and the HUD placement are all unexercised.
+
+> **Superseded 2026-08-18 — see §14.** A Quest 3 has now run this APK. The link, codec, reconnect and frame rate all
+> work; the device-side capture does not. Four defects, including a head pose stuck at the origin and a dead
+> device-side e-stop. Read §14 before trusting anything in this section. §12.6 lists handedness first for a reason — if the arms
 mirror left and right, `ToOpenXR()` is the only thing that can cause it. If passthrough comes up black, the manifest
 feature is declared `required="false"` (Meta's "Supported" rather than "Required") — that is the first thing to try
 changing, in `QuestManifest.cs`.
@@ -987,3 +991,127 @@ changing, in `QuestManifest.cs`.
 Still open beyond that: TLS (`UseTls = false` is the default because there is no server-side context to talk to —
 isolated lab network only, and this remains the one thing that looks finished and is not), hand tracking and its 26→25
 joint mapping, and threshold tuning against real human motion rather than synthetic.
+
+---
+
+## 14. First contact with a real Quest 3 — 2026-08-18
+
+The APK finally met the host. §13.6's "not verified on a headset" is now partly answered: the transport works, and the
+device-side capture does not. Everything below is measured, not inferred — the raw numbers are in §14.3.
+
+Setup: Isaac Sim (`Isaac-PickPlace-Cylinder-G129-Dex3-Joint`, `--enable_dex3_dds`, DDS domain 1) on the host at
+192.168.123.2, Quest 3 at 192.168.123.3 over the demo router, `ws://192.168.123.2:8443` with TLS off.
+
+### 14.1 What worked
+
+- **Protocol v2 negotiated on the first attempt.** `hello from quest3 proto=2`, no framing or version friction. The
+  §12.8 warning to "expect protocol friction at first contact" did not materialise — the codec's C#/Python parity
+  tests earned their place.
+- **Reconnect backoff works on the wire**, not just in the simulator: repeated drops recovered without intervention.
+- **72 Hz sustained** — the device's own telemetry reported 2000 frames in 27.75 s, and the host counted 978 unique
+  sequence numbers in 30 s.
+- **The watchdog's `frozen` detector fired correctly on real data.** It was not a false positive: the head pose
+  genuinely was frozen, for the reason in §14.2. This is the first time a safety detector caught a real device fault
+  rather than a synthetic one.
+
+### 14.2 Four device-side defects
+
+All four are in `quest_app/`. None are host-side, and none were reachable by the 168 host tests.
+
+**1. The head pose is always exactly the identity matrix.** This is the serious one. `TeleopSession.Head()` resolves
+to the `OVRCameraRig` centre-eye anchor, and that anchor is never updated on a rig built at runtime through
+`AddComponent` — so `head.position` stays at the origin for the life of the session.
+
+The consequence is not "the head is missing", it is worse than that. The whole transform chain is
+`p_wrist − p_head` (§2). With `p_head ≡ 0` the wrists are sent in absolute tracking-space coordinates, and the
+head-relative frame the robot expects silently becomes something else. `JumpGuard`'s head-jump detector can also never
+fire, because a constant is never a jump — the detector for the project's founding hazard is dead on this transport.
+
+The controllers prove the fix direction: `PoseOf()` uses `OVRInput.GetLocalControllerPosition()`, which reads node
+poses directly and works perfectly. The head should use the same path — `OVRPlugin.GetNodePose(Node.EyeCenter, …)` or
+`InputTracking.GetLocalPosition(XRNode.CenterEye)` — rather than depending on a rig anchor being driven.
+
+**2. `OVRInput.IsControllerConnected()` returns false for both controllers, permanently**, while those same
+controllers stream live poses. The host therefore latches `tracking_lost(left+right)` and refuses to follow, so the
+session can never leave `idle`. The device is not at fault: `dumpsys input` shows both Touch controllers registered,
+enabled and classed `INPUT_DEVICE_CLASS_VR_PERIPHERAL`, and the system logged
+`InputDevice_TrackedRemote: typical controller latency in com.wegorobotics.g1teleop: 0.024` for each of them.
+`OVRInput.GetControllerPositionTracked()` reports actual tracking validity and is the right query here.
+
+**3. No button message ever reaches the host.** `buttons` stayed `()` across every frame of every session, including
+while Y+B was pressed. **The device-side emergency stop does not work.** §13.3 recorded fixing the button path
+end-to-end, but that fix was verified against `fake_quest`, which synthesises the control message directly — it never
+exercised `OVRInput.Get(Button…)` on hardware. Same root as defect 2: node poses work, controller *state* queries do
+not.
+
+**4. `Debug.Log` output is stripped from the release build.** Zero `[XrLink]` / `[Teleop]` lines in logcat across the
+whole session, while `[OVRManager]` lines from the SDK appear normally. Every diagnosis above had to be made from the
+host side instead. For bring-up this needs to be fixed first, or the next defect costs as much to find as these did.
+
+### 14.3 The measurement that settled it
+
+`XrLinkServer` run standalone as a probe, no teleop and no safety layer, logging the decoded frame. 978 unique frames
+over 30 s while the operator moved head and both controllers deliberately:
+
+```
+head  : spread(xyz)=[0.     0.     0.    ]  FROZEN
+left  : spread(xyz)=[0.2071 0.1647 0.1174]  LIVE
+right : spread(xyz)=[0.1835 0.1586 0.1138]  LIVE
+
+flag combos seen (left_tracked, right_tracked, worn): {(False, False, True)}
+button sets seen: {()}
+```
+
+Two channels of the same device, sampled identically: the controllers move 20 cm and the head does not move at all.
+That single table separates "the operator is standing still" from "the head is not wired up", and no amount of reading
+the C# would have done it as quickly. **Probe the wire before reading the source** — the device is the only authority
+on what the device sends.
+
+Three earlier diagnoses were wrong before this measurement: that the controllers were switched off (they were not),
+that the app had lost focus (it had, repeatedly, but `tracking_lost` persisted through a 26 s focused window), and that
+`OVRInput` was dead altogether (its pose half works fine). Each was consistent with the evidence available at the time
+and each was refuted by the next measurement.
+
+### 14.4 Also found, host-side
+
+**The `vtv` environment shadows this repo with three other checkouts.** `televuer` and `teleimager` resolve to
+`~/unitree_sim_isaaclab/xr_teleoperate/`, `dex_retargeting` to `~/xr_teleoperate/`, all via editable-install `.pth`
+files. The Vuer path therefore crashes on startup against a `televuer` that predates the Phase 0 liveness work:
+
+```
+AttributeError: 'TeleVuerWrapper' object has no attribute 'get_link_status'
+```
+
+The 168 tests do not catch this — they import the repo's own copies directly, while at runtime the `.pth` wins. Until
+the installs are repointed, both paths need:
+
+```bash
+export PYTHONPATH="teleop/televuer/src:teleop/teleimager/src:teleop/robot_control/dex-retargeting/src"
+```
+
+This also means the Phase 1 `image_client` fixes (§3.4, §3.5) have never run — the other checkout's copy was loaded
+every time.
+
+**`teleop_hand_and_arm.py` must be run from `teleop/`.** The URDF path is relative (`../assets/g1/…`), so the
+invocation in §12.5 and §13.5 fails from the repo root. `dashboard.py` already spawns it with `cwd=teleop/`.
+
+**`run_dashboard.sh` takes `sim` as a positional argument, not `--sim`.** `--sim` reaches `dashboard.py`, which has no
+such flag, and argparse rejects it. Easy to trip over, because the teleop script it launches *does* use `--sim`.
+
+### 14.5 The align gate is not covered by the simulator
+
+`fake_quest` emits fixed synthetic poses (head at 1.60 m, wrists at ±0.20/1.50/−0.30), which sit ~50 cm from wherever
+the robot's FK puts its wrists. The gate correctly refuses — `move to the robot's pose — off by left 50cm, right 50cm`
+— which means **no simulator scenario can ever reach `FOLLOWING` through the gate.** §12.5's "154/154 cycles followed"
+was measured with `--skip-align`, and that is not recorded there.
+
+So the gate has unit tests but no end-to-end coverage. Making `fake_quest` read the robot's FK and offer a pose near
+it would close that hole, and is worth doing before the gate is trusted on hardware.
+
+### 14.6 What this leaves
+
+Verified today, on hardware: the link, the codec, reconnect, frame rate, and the watchdog's freeze detector.
+
+Still unverified, and now blocked behind §14.2: handedness (§12.6 — the wrists arrive, but nothing has consumed them
+through IK yet), presence timing (§10.3's doff-latency run), passthrough, HUD placement, the align gate on a real
+operator, and TLS.
