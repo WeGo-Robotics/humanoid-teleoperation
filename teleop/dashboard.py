@@ -1362,6 +1362,10 @@ class Dashboard(QWidget):
             f"L {fmt(align.get('left_pos_err'), align.get('left_rot_err'))}\n"
             f"R {fmt(align.get('right_pos_err'), align.get('right_rot_err'))}")
 
+        # `within_tolerance` gates acceptance on the guided path, same as
+        # before -- unless the operator is also holding the in-VR skip (both
+        # A/X), which this summary line doesn't distinguish from "still
+        # aligning". See teleop/safety/align.py.
         ok = bool(align.get("within_tolerance"))
         self.align_title.setText("정렬 확인됨 — 확정 대기" if ok else "정렬 중")
         self.align_title.setStyleSheet(
@@ -1646,6 +1650,7 @@ class Dashboard(QWidget):
         net = self.cmb_net.currentData()
         img_ip = self.ed_camip.text().strip() or a.img_server_ip
         cmd = [sys.executable, script, "--ipc",
+               "--xr-source", "xrlink",
                "--input-mode", input_mode,
                "--arm", a.arm,
                "--img-server-ip", img_ip]
