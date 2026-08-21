@@ -43,7 +43,6 @@ namespace WeGo.Teleop
             session.HostAddress = HostAddress;
             session.Port = Port;
             session.UseTls = UseTls;
-            session.HeadTransform = head != null ? head.transform : null;
 
             var hud = gameObject.AddComponent<TeleopHud>();
             hud.Session = session;

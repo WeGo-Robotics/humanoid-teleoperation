@@ -6,18 +6,41 @@ if their arms were nowhere near the robot's, the first control cycle commanded a
 large discontinuity. The README handled this with a human instruction ("align
 your arm to the robot's initial pose"), which is not a guard.
 
-The gate requires **two independent agreements**, held continuously:
+The gate requires **two independent agreements, held continuously**:
 
-1. *The host agrees.* Forward kinematics of the robot's current arm joints gives
-   where its wrists actually are; the operator's wrist targets must be within
-   tolerance of that. This is computed from robot state, so a headset that lies
-   or mis-transforms cannot talk its way past it.
-2. *The operator agrees.* A deliberate two-handed gesture (both pinches, or both
-   triggers) held for `hold_s`.
+1. *The host agrees.* Forward kinematics of the robot's current arm joints
+   (`ArmFKMixin.forward_kinematics(q)`) gives where its wrists actually are;
+   the operator's wrist targets must be within tolerance of that. Computed
+   from robot state, so a headset that lies or mis-transforms cannot talk its
+   way past it.
+2. *The operator agrees.* A deliberate two-handed gesture (both pinches, or
+   both triggers) held for `hold_s`.
 
-Either one lapsing resets the hold to zero. Requiring both to persist -- rather
-than sampling them once at the moment of confirmation -- is what stops an
-operator from drifting out of position during the countdown.
+Either lapsing resets the hold to zero.
+
+**A layman operator cannot satisfy (1) blind.** Passthrough shows the robot,
+but nothing marks where their hand needs to be relative to it, so the first
+on-hardware session found the hold almost never accumulating -- see
+docs §14.7. Two things followed from that, both host-side (per `TeleopHud`'s
+own header: "if you find yourself wanting to add a condition here that
+changes behaviour ... it belongs on the host"):
+
+* `reason` now carries **directional guidance** for each out-of-tolerance
+  wrist -- which way to move, how far, and a rough closeness percentage --
+  rather than just "off by 30cm". It is plain text so it renders on the HUD
+  with no protocol or Unity change.
+* An explicit, deliberate **skip**: holding both A/X buttons (`skip_requested`)
+  *together with* the confirm gesture waives requirement (1) for that hold,
+  falling through to confirm-gesture-only acceptance. This is not a second,
+  weaker gate -- the operator still has to hold a continuous two-handed
+  gesture for the full `hold_s`, they are just no longer also required to
+  have found the exact pose first. What makes the skip path safe is the same
+  thing that makes the guided path's first following-cycle safe:
+  `robot_arm.py`'s per-cycle joint velocity limiter (`clip_arm_q_target`,
+  ramped in by `speed_gradual_max`) bounds how fast the commanded target can
+  move regardless of where it starts, unconditionally, from the moment
+  following begins. Skipping the position check changes how far the robot
+  eases to catch up; it does not remove the cap on how fast.
 """
 from __future__ import annotations
 
@@ -29,10 +52,12 @@ import numpy as np
 
 @dataclass
 class AlignConfig:
-    pos_tol_m: float = 0.10      # per-wrist position tolerance
-    rot_tol_deg: float = 25.0    # per-wrist orientation tolerance
-    hold_s: float = 2.0          # continuous agreement before accepting
-    timeout_s: float = 120.0     # give up and return to idle
+    pos_tol_m: float = 0.10        # per-wrist position tolerance
+    rot_tol_deg: float = 25.0      # per-wrist orientation tolerance
+    hold_s: float = 2.0            # continuous agreement before accepting
+    timeout_s: float = 120.0       # give up and return to idle
+    guidance_range_m: float = 0.75  # informational only: distance at which the
+                                     # HUD's closeness percentage reads 0%
 
 
 @dataclass(frozen=True)
@@ -96,6 +121,8 @@ class AlignGate:
         self._started = now
         self._hold_since: Optional[float] = None
         self._accepted = False
+        self._last_within = False
+        self._last_errs = (float("inf"), float("inf"), float("inf"), float("inf"))
 
     @property
     def accepted(self) -> bool:
@@ -104,14 +131,24 @@ class AlignGate:
     def update(self, now: float,
                robot_left: Optional[np.ndarray], robot_right: Optional[np.ndarray],
                operator_left: np.ndarray, operator_right: np.ndarray,
-               operator_confirming: bool) -> AlignReport:
+               operator_confirming: bool,
+               skip_requested: bool = False) -> AlignReport:
         """One evaluation cycle.
 
         `robot_left` / `robot_right` come from FK of the current arm joints.
-        `None` means FK failed -- reported as not-aligned, never as aligned.
+        `None` means FK failed -- reported as not-in-tolerance, and (guided
+        path) blocks acceptance same as any other out-of-tolerance reading.
+
+        `skip_requested` is the operator holding both A/X buttons: see module
+        docstring. It only ever *relaxes* requirement (1); it cannot substitute
+        for the confirm gesture, and it is re-read every cycle like everything
+        else that feeds this hold -- letting go of either resets it the same
+        way.
         """
         if self._accepted:
-            return self._report(True, True, True, False, self.cfg.hold_s, 1.0,
+            lp, rp, lr, rr = self._last_errs
+            return self._report(self._last_within, True, True, False,
+                                self.cfg.hold_s, 1.0, lp, rp, lr, rr,
                                 reason="accepted")
 
         elapsed = now - self._started
@@ -119,20 +156,24 @@ class AlignGate:
             return self._report(False, operator_confirming, False, True, 0.0, 0.0,
                                 reason="alignment timed out")
 
+        left_delta = right_delta = None
         if robot_left is None or robot_right is None:
-            self._hold_since = None
-            return self._report(False, operator_confirming, False, False, 0.0, 0.0,
-                                reason="robot pose unavailable — cannot verify")
-
-        lp, lr = pose_error(operator_left, robot_left)
-        rp, rr = pose_error(operator_right, robot_right)
-        within = (lp <= self.cfg.pos_tol_m and rp <= self.cfg.pos_tol_m
-                  and lr <= self.cfg.rot_tol_deg and rr <= self.cfg.rot_tol_deg)
+            within, lp, rp, lr, rr = False, float("inf"), float("inf"), float("inf"), float("inf")
+        else:
+            lp, lr = pose_error(operator_left, robot_left)
+            rp, rr = pose_error(operator_right, robot_right)
+            within = (lp <= self.cfg.pos_tol_m and rp <= self.cfg.pos_tol_m
+                      and lr <= self.cfg.rot_tol_deg and rr <= self.cfg.rot_tol_deg)
+            left_delta = np.asarray(robot_left)[0:3, 3] - np.asarray(operator_left)[0:3, 3]
+            right_delta = np.asarray(robot_right)[0:3, 3] - np.asarray(operator_right)[0:3, 3]
+        self._last_within, self._last_errs = within, (lp, rp, lr, rr)
 
         # Both agreements must hold *continuously*; either lapsing restarts the
-        # countdown. Sampling them once at the end would let the operator drift
-        # out of position while the timer ran.
-        if within and operator_confirming:
+        # countdown. Sampling once at the end would let the operator drift out
+        # of position -- or let go of skip, or of the confirm gesture -- during
+        # the countdown and still get credit.
+        gate_satisfied = operator_confirming and (within or skip_requested)
+        if gate_satisfied:
             if self._hold_since is None:
                 self._hold_since = now
             held = now - self._hold_since
@@ -147,27 +188,61 @@ class AlignGate:
 
         if accepted:
             reason = "accepted"
-        elif not within:
-            reason = self._deviation_hint(lp, rp, lr, rr)
         elif not operator_confirming:
-            reason = "in position — hold both hands to confirm"
+            reason = "hold both hands to confirm"
+            if not within:
+                reason += " — " + self._guidance(lp, rp, left_delta, right_delta)
+        elif not (within or skip_requested):
+            reason = (self._guidance(lp, rp, left_delta, right_delta) +
+                      " — or hold both A/X to skip")
         else:
             reason = f"hold… {progress * 100:.0f}%"
+            if skip_requested and not within:
+                reason += " (position check skipped)"
 
         return self._report(within, operator_confirming, accepted, False, held,
                             progress, lp, rp, lr, rr, reason)
 
-    def _deviation_hint(self, lp, rp, lr, rr) -> str:
-        worst = []
+    def _closeness_pct(self, pos_err: float) -> float:
+        """0% at `guidance_range_m` away, 100% inside tolerance. Informational
+
+        only -- a rough sense of scale for the HUD, not a threshold anything
+        acts on."""
+        if not np.isfinite(pos_err):
+            return 0.0
+        if pos_err <= self.cfg.pos_tol_m:
+            return 100.0
+        span = max(self.cfg.guidance_range_m - self.cfg.pos_tol_m, 1e-6)
+        return max(0.0, 100.0 * (1.0 - (pos_err - self.cfg.pos_tol_m) / span))
+
+    @staticmethod
+    def _direction_hint(delta: np.ndarray) -> str:
+        """`delta` = target - actual, robot frame (+x fwd, +y left, +z up --
+
+        see docs/xr_automation_and_safety_plan.md §9, test_transforms.py's
+        TestPhysicalDirections). Axes under 1cm are omitted so the hint does
+        not jitter with noise once the operator is close."""
+        x, y, z = delta
+        parts = []
+        if abs(x) >= 0.01:
+            parts.append(f"{'fwd' if x > 0 else 'back'} {abs(x) * 100:.0f}cm")
+        if abs(y) >= 0.01:
+            parts.append(f"{'left' if y > 0 else 'right'} {abs(y) * 100:.0f}cm")
+        if abs(z) >= 0.01:
+            parts.append(f"{'up' if z > 0 else 'down'} {abs(z) * 100:.0f}cm")
+        return ", ".join(parts) if parts else "in position"
+
+    def _guidance(self, lp, rp, left_delta, right_delta) -> str:
+        if left_delta is None or right_delta is None:
+            return "robot pose unavailable"
+        bits = []
         if lp > self.cfg.pos_tol_m:
-            worst.append(f"left {lp * 100:.0f}cm")
+            bits.append(f"L {self._direction_hint(left_delta)} "
+                        f"({self._closeness_pct(lp):.0f}%)")
         if rp > self.cfg.pos_tol_m:
-            worst.append(f"right {rp * 100:.0f}cm")
-        if lr > self.cfg.rot_tol_deg:
-            worst.append(f"left {lr:.0f}°")
-        if rr > self.cfg.rot_tol_deg:
-            worst.append(f"right {rr:.0f}°")
-        return "move to the robot's pose — off by " + ", ".join(worst)
+            bits.append(f"R {self._direction_hint(right_delta)} "
+                        f"({self._closeness_pct(rp):.0f}%)")
+        return "  ".join(bits) if bits else "in position"
 
     def _report(self, within, confirming, accepted, timed_out, held, progress,
                 lp=float("inf"), rp=float("inf"), lr=float("inf"),

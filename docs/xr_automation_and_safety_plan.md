@@ -658,6 +658,13 @@ reads exists on `XRFrame`, so a missed field fails at test time rather than mid-
 
 ### 11.2 The alignment gate
 
+**Updated 2026-08-21 — see §14.7.** First-contact use surfaced a real problem with the original design (below): a
+layman operator wearing the headset cannot see where the robot's wrists are, so "match the robot's pose" was an
+instruction with no way to follow it, and the hold almost never accumulated. The fix keeps the original two-agreement
+design as the default — it is still the safer path — and adds two things: guidance text that tells the operator which
+way to move, and an explicit, deliberate skip for when guidance still is not enough. Both are described below; §14.7
+has the reasoning and what was tried first.
+
 The gate requires **two independent agreements, held continuously**:
 
 1. **The host agrees** — `ArmFKMixin.forward_kinematics(q)` gives where the robot's wrists actually are, through the
@@ -669,13 +676,28 @@ The gate requires **two independent agreements, held continuously**:
    gesture is far too easy to trigger while getting into position.
 
 Either lapsing resets the hold to zero. Ten seconds of intermittent agreement never adds up to acceptance — there is a
-test for exactly that. FK failure reports "cannot verify", never "verified", and logs once so it cannot masquerade as a
-hang.
+test for exactly that. FK failure reads as not-in-tolerance and blocks this path the same as any other deviation.
+
+**Guidance.** While requirement (1) is unmet, `AlignGate` fills `reason` with per-wrist direction and rough distance —
+e.g. `L fwd 12cm, up 5cm (62%)` — computed from the same FK/operator poses already being compared, in the robot's own
+axis convention (§9: +x forward, +y left, +z up). `reason` is the one field the headset already renders verbatim
+(`TeleopHud.cs` — "if you find yourself wanting to add a condition here that changes behaviour ... it belongs on the
+host"), so this reaches the HUD with no protocol or Unity change, and reaches the dashboard the same way.
+
+**Skip.** If the operator also holds both A/X buttons (`skip_requested`) while doing the confirm gesture, requirement
+(1) is waived for that hold — position is still reported, just no longer required. This is not a weaker gate bolted
+on top: the confirm gesture must still be held continuously for the full `--align-hold`, and letting go of *either*
+the gesture or skip resets the hold to zero, same as the guided path. What makes this safe to waive is that position
+agreement was never actually what bounded the first-cycle discontinuity — `robot_arm.py`'s per-control-cycle joint
+velocity limiter (`clip_arm_q_target`, ramped in by `speed_gradual_max`) does, unconditionally, from the moment
+following begins, regardless of where the commanded target starts. Skipping changes how far the robot eases to catch
+up; it does not remove the cap on how fast. This is distinct from the pre-existing `--skip-align` CLI flag, which
+bypasses the confirm gesture too and is a startup-time, not per-session, decision.
 
 **This works on the transport that ships today.** The confirm gesture comes from existing Vuer pinch/trigger data, so
 the gate is live without waiting for the native app. On the browser transport the prompt renders on the dashboard
 (deviation per wrist, hold progress, cancel) because that transport is receive-only; `NativeXRSource.send()` will put
-it in the headset.
+it in the headset. The skip buttons are controller-mode only for now, consistent with §12.2's "controllers first."
 
 ### 11.3 Wire format
 
@@ -1102,11 +1124,14 @@ such flag, and argparse rejects it. Easy to trip over, because the teleop script
 
 `fake_quest` emits fixed synthetic poses (head at 1.60 m, wrists at ±0.20/1.50/−0.30), which sit ~50 cm from wherever
 the robot's FK puts its wrists. The gate correctly refuses — `move to the robot's pose — off by left 50cm, right 50cm`
-— which means **no simulator scenario can ever reach `FOLLOWING` through the gate.** §12.5's "154/154 cycles followed"
-was measured with `--skip-align`, and that is not recorded there.
+— which means **no simulator scenario can ever reach `FOLLOWING` through the guided path.** §12.5's "154/154 cycles
+followed" was measured with `--skip-align`, and that is not recorded there.
 
-So the gate has unit tests but no end-to-end coverage. Making `fake_quest` read the robot's FK and offer a pose near
-it would close that hole, and is worth doing before the gate is trusted on hardware.
+§14.7 kept position as the default requirement rather than dropping it, so this gap is still open — but §14.7's skip
+path (both A/X buttons held with confirm) is exactly the mechanism needed to close it without touching FK. `fake_quest`
+does not have a scenario that presses `left_a`+`right_a` alongside `--confirm` yet; adding one (alongside `buttons`,
+which already exercises `left_thumb`/`right_thumb`/`right_a`) would let a simulator run reach `FOLLOWING` for the
+first time. Worth doing before the gate is trusted on hardware.
 
 ### 14.6 What this leaves
 
@@ -1115,3 +1140,119 @@ Verified today, on hardware: the link, the codec, reconnect, frame rate, and the
 Still unverified, and now blocked behind §14.2: handedness (§12.6 — the wrists arrive, but nothing has consumed them
 through IK yet), presence timing (§10.3's doff-latency run), passthrough, HUD placement, the align gate on a real
 operator, and TLS.
+
+### 14.7 The align gate's position requirement did not survive contact with a headset
+
+Even with §14.2's device-side fixes applied, one thing about the gate itself (§11.2, as originally built) does not
+work: it required the operator to physically move their arms into the robot's *own* current pose — verified against
+`ArmFKMixin.forward_kinematics(q)` — before the confirm gesture could start accumulating hold time. On a headset,
+that instruction has no answer. The operator cannot see where the robot's wrists are; passthrough shows the robot,
+but nothing marks "here is where your hand needs to be" in it. Without that feedback the operator is matching a pose
+by guesswork, drifts constantly, and `within` flips true/false too fast for `--align-hold` seconds of it to ever
+accumulate continuously. This would have been the fifth device-side defect in §14.2 if it were device-side; it is not
+— it is a gate design that assumed feedback the transport never provided.
+
+Position agreement was never actually what stopped the discontinuity that motivated the gate (§11.2's original
+opening paragraph, also `teleop/safety/align.py`'s docstring). `robot_arm.py` already caps how fast a commanded joint
+target can move on every control cycle (`clip_arm_q_target`, ramped in by `speed_gradual_max`), unconditionally,
+regardless of where the target starts — including the first cycle after this gate accepts. That limiter is what
+bounds the jump.
+
+**First attempt, reverted:** dropping the position requirement entirely and keeping only the confirm gesture. This
+worked and was simpler, but traded away a real property — a headset that lies or mis-transforms could no longer be
+caught by an independent check, only rate-limited after the fact — for a UX problem that has a narrower fix. Kept only
+as the shape the skip path below reuses.
+
+**What shipped instead:** the two-agreement design stays the default, and two things were added on top of it rather
+than replacing it, both host-side per `TeleopHud.cs`'s own rule ("if you find yourself wanting to add a condition here
+that changes behaviour ... it belongs on the host"):
+
+* **Guidance.** `AlignGate` now fills `reason` with per-wrist direction and a rough closeness percentage whenever
+  requirement (1) is unmet — e.g. `L fwd 12cm, up 5cm (62%)` — computed from the same FK/operator poses already being
+  compared, in the robot's axis convention (§9). Because `reason` is the one field the headset already renders
+  verbatim, this reaches the HUD and the dashboard with no protocol or Unity change.
+* **Skip.** Holding both A/X buttons together with the confirm gesture waives requirement (1) for that hold. The
+  confirm gesture and its continuity requirement are unchanged — skip only relaxes the position check, and letting go
+  of either resets the hold the same way position drift used to. This is the operator's deliberate escape hatch for
+  when guidance still is not converging (arm-length limits, a bad initial robot pose, a rushed operator), and it is
+  what makes the "first attempt" design available on demand rather than the default. Distinct from the pre-existing
+  `--skip-align` CLI flag, which bypasses the confirm gesture too and is a startup-time decision, not a per-session
+  one.
+
+See §11.2 for the current design and `teleop/safety/align.py` for the implementation and its docstring. §14.5's
+simulator-coverage gap is *not* closed by this — the guided path still needs `fake_quest` to know the robot's FK,
+which it does not — but the skip path gives a concrete way to close it (see §14.5). All 29 align-gate tests were
+rewritten or added alongside the change (`teleop/tests/test_align.py`, up from 20) — total suite is 177, still green.
+
+Not yet re-verified on hardware: whether the guidance text is actually legible/actionable on the HUD panel at its
+current size, whether `--align-hold` (2.0 s) feels right for either path, and whether the eased catch-up motion after
+a skip is comfortable to stand in front of when the starting deviation is large. Worth watching on the next session.
+
+## 15. Second Quest 3 session — 2026-08-21
+
+Build, install and launch all work. `tools/build_quest_apk.ps1` produced a 45.9 MB APK in 50–150 s against Unity
+2022.3.32f1, and `adb install -r` onto the headset succeeded every time. Two mechanical notes for next time: Unity's
+Android build **kills the adb daemon**, so the device drops to `unauthorized` after every build and needs
+`adb kill-server && adb start-server`; and the default logcat ring is 256 KiB, which `VrApi` fills with a ~1 KB
+stats line every second, rotating the app's own lines out before they can be read. `adb logcat -G 16M` plus
+`setprop debug.oculus.disableVrApiStats 1` fixes that and should be the first thing done on any bring-up.
+
+### 15.1 Defect 4 is fixed, and immediately earned its keep
+
+A build made with `-Development` puts `Debug.Log` in logcat with full managed stack traces. That is the whole of the
+§14.2 defect 4 fix, and the first thing it surfaced was a defect nobody knew about — §15.2. Making the app legible
+paid for itself inside one session.
+
+### 15.2 Defect 5: a logging statement in the Meta SDK was taking down the control link
+
+`OVRManager.InitOVRManager()` throws `NullReferenceException` out of
+`XRGeneralSettings.Instance.Manager.activeLoader` (`OVRManager.cs:2461-2466`, SDK 78.0.0) when `OVRManager` is added
+at runtime rather than living in the scene. Unity surfaces an exception from a component's `Awake` back through
+`AddComponent` to the caller, so it aborted `TeleopBootstrap.Awake()` at line 60 — **`TeleopSession` and `TeleopHud`
+were never constructed**. The headset showed `DISCONNECTED` forever with not one `[XrLink]` line in logcat, because
+nothing was ever attempting to connect.
+
+Confirmed on a manual launch from inside the headset, not just an `adb`/`monkey` launch:
+
+```
+NullReferenceException: Object reference not set to an instance of an object.
+  at WeGo.Teleop.TeleopBootstrap.BuildCameraRig () TeleopBootstrap.cs:60
+  at WeGo.Teleop.TeleopBootstrap.Awake ()          TeleopBootstrap.cs:37
+```
+
+The block that throws does nothing but `Debug.Log` the active loader's settings, *after* the functional half of
+initialisation. A diagnostic statement was killing the robot's control channel.
+
+**This is the same root cause as defect 1.** §14.2 traced the frozen head pose to the centre-eye anchor never being
+driven "on a rig built at runtime through `AddComponent`". Both defects come from building the OVR rig in `Awake()`
+instead of having it in the scene. `TeleopBootstrap`'s header argues for a code-built scene over a committed
+`.unity` file, and that argument still holds for *our* objects — but `OVRManager` is not ours, and it expects normal
+scene-load ordering.
+
+**Fix, not yet done:** construct the rig in `QuestBuild.GenerateScene()` so `OVRManager` initialises under scene
+load. That is one change addressing defects 1 and 5 together, and it should land before the next hardware session.
+
+A try/catch around `AddComponent<OVRManager>()` was tried and reverted. It let `Awake()` finish, but the app then
+rendered a black screen with no HUD — a worse failure than the one it fixed, and a reminder that a half-initialised
+`OVRManager` is not a state the SDK supports. Guarding the symptom did not work; the rig has to move.
+
+### 15.3 What is still unmeasured
+
+Defects 1, 2 and 3 remain **unverified on hardware**. The `TeleopSession` rewrite compiles and installs, but no frame
+has reached a host, so none of those paths have been exercised on device. §13.3 recorded the button path as fixed on
+the strength of a `fake_quest` run and §14.2 found it dead on hardware; the same claim must not be made twice.
+
+The blocker is topology, not code. The Quest 3 has no Ethernet, and the teleop host lives on the wired
+`192.168.123.x` robot network. During this session the headset had **no network at all** — Wi-Fi disabled, loopback
+only — and `192.168.123.2` answered neither ping nor TCP 8443 from the wired side either. One of these has to be
+true before defects 1–3 can be measured:
+
+* a Wi-Fi AP bridged onto the robot network for the headset to join, or
+* the host running somewhere the headset's Wi-Fi can reach, or
+* **USB loopback** — build with `-HostAddress 127.0.0.1`, `adb reverse tcp:8443 tcp:8443`, and run `XrLinkServer`
+  standalone as the §14.3 probe. This needs only `websockets` and `numpy`, no `pinocchio`, no robot, and no open
+  port on any shared network. It is the cheapest way to close defects 1–3 and matches §13.5's bring-up order, which
+  puts the headset-with-robot-off step before the robot.
+
+The USB-loopback path was set up and confirmed working this session — `adb reverse` created the device-side
+listener — but §15.2 stopped the app before a single frame was sent.

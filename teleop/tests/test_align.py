@@ -44,11 +44,13 @@ class Rig:
         self.left = pose(0.15, 0.25, 0.45)     # start perfectly aligned
         self.right = pose(0.15, -0.25, 0.45)
         self.confirming = False
+        self.skip = False
 
     def step(self, dt=None):
         self.now += dt if dt is not None else self.DT
         return self.gate.update(self.now, ROBOT_L, ROBOT_R,
-                                self.left, self.right, self.confirming)
+                                self.left, self.right, self.confirming,
+                                self.skip)
 
     def run(self, seconds):
         report = None
@@ -74,7 +76,11 @@ class TestPoseError(unittest.TestCase):
         self.assertAlmostEqual(r, 30.0, places=4)
 
 
-class TestBothAgreementsRequired(unittest.TestCase):
+class TestGuidedPathRequiresBothAgreements(unittest.TestCase):
+    """Default path (`skip_requested=False`): unchanged from the original
+
+    design -- position and the confirm gesture must both hold continuously."""
+
     def test_aligned_but_not_confirming_never_accepts(self):
         rig = Rig()
         rig.confirming = False
@@ -84,14 +90,16 @@ class TestBothAgreementsRequired(unittest.TestCase):
         self.assertIn("hold both hands", report.reason)
 
     def test_confirming_but_not_aligned_never_accepts(self):
-        """The operator cannot gesture their way past the host's check."""
+        """The operator cannot gesture their way past the host's check --
+
+        not without also holding skip (see TestSkipPath)."""
         rig = Rig()
         rig.left = pose(0.15, 0.25, 1.10)      # 65cm high
         rig.confirming = True
         report = rig.run(5.0)
         self.assertFalse(report.accepted)
         self.assertFalse(report.within_tolerance)
-        self.assertIn("off by", report.reason)
+        self.assertIn("or hold both A/X to skip", report.reason)
 
     def test_both_agreeing_accepts_after_the_hold(self):
         rig = Rig()
@@ -113,8 +121,52 @@ class TestBothAgreementsRequired(unittest.TestCase):
         self.assertTrue(rig.step().accepted, "acceptance must not un-accept")
 
 
+class TestSkipPath(unittest.TestCase):
+    """Holding both A/X buttons (`skip_requested`) alongside the confirm
+
+    gesture waives the position agreement -- but not the gesture itself, and
+    not continuity: see module docstring in align.py."""
+
+    def test_skip_without_confirm_gesture_never_accepts(self):
+        """Skip only relaxes the position check; it is not a second way in."""
+        rig = Rig()
+        rig.left = pose(0.15, 0.25, 1.10)
+        rig.confirming = False
+        rig.skip = True
+        report = rig.run(5.0)
+        self.assertFalse(report.accepted)
+
+    def test_skip_plus_confirm_accepts_far_out_of_position(self):
+        rig = Rig()
+        rig.left = pose(0.15, 0.25, 1.10)      # 65cm high -- well out of tolerance
+        rig.confirming = True
+        rig.skip = True
+        report = rig.run(5.0)
+        self.assertTrue(report.accepted)
+        self.assertFalse(report.within_tolerance, "still reported, just not gating")
+
+    def test_releasing_skip_before_the_hold_elapses_resets_it(self):
+        rig = Rig()
+        rig.left = pose(0.15, 0.25, 1.10)
+        rig.confirming = True
+        rig.skip = True
+        mid = rig.run(1.0)
+        self.assertGreater(mid.progress, 0.4)
+        rig.skip = False
+        after = rig.step()
+        self.assertEqual(after.held_s, 0.0, "letting go of skip must reset the hold")
+
+    def test_skip_is_irrelevant_once_already_in_tolerance(self):
+        rig = Rig(AlignConfig(hold_s=0.2))
+        rig.confirming = True
+        rig.skip = True
+        report = rig.run(0.5)
+        self.assertTrue(report.accepted)
+        self.assertTrue(report.within_tolerance)
+
+
 class TestHoldResets(unittest.TestCase):
-    def test_drifting_out_of_position_resets_the_hold(self):
+    def test_drifting_out_of_position_resets_the_hold_on_the_guided_path(self):
         rig = Rig()
         rig.confirming = True
         mid = rig.run(1.0)
@@ -129,6 +181,20 @@ class TestHoldResets(unittest.TestCase):
         resumed = rig.run(0.5)
         self.assertLess(resumed.progress, 0.9, "hold restarted, not resumed")
         self.assertFalse(resumed.accepted)
+
+    def test_drifting_out_of_position_does_not_reset_the_hold_on_the_skip_path(self):
+        rig = Rig()
+        rig.confirming = True
+        rig.skip = True
+        mid = rig.run(1.0)
+        self.assertGreater(mid.progress, 0.4)
+
+        rig.left = pose(0.15, 0.25, 1.10)       # operator drifts, still confirming+skip
+        after = rig.step()
+        self.assertGreater(after.held_s, 0.9, "position drift must not reset a skip hold")
+
+        resumed = rig.run(1.5)
+        self.assertTrue(resumed.accepted)
 
     def test_releasing_the_gesture_resets_the_hold(self):
         rig = Rig()
@@ -178,7 +244,9 @@ class TestTolerance(unittest.TestCase):
 
 class TestFailureModes(unittest.TestCase):
     def test_missing_robot_pose_is_never_treated_as_aligned(self):
-        """FK failure must read as 'cannot verify', not 'verified'."""
+        """FK failure must read as not-in-tolerance and block the guided
+
+        path, same as any other out-of-tolerance reading."""
         gate = AlignGate(AlignConfig(hold_s=0.2))
         gate.reset(0.0)
         report = None
@@ -186,7 +254,16 @@ class TestFailureModes(unittest.TestCase):
             report = gate.update(i * 0.03, None, None, ROBOT_L, ROBOT_R, True)
         self.assertFalse(report.accepted)
         self.assertFalse(report.within_tolerance)
-        self.assertIn("cannot verify", report.reason)
+
+    def test_missing_robot_pose_still_accepts_via_skip(self):
+        gate = AlignGate(AlignConfig(hold_s=0.2))
+        gate.reset(0.0)
+        report = None
+        for i in range(20):
+            report = gate.update(i * 0.03, None, None, ROBOT_L, ROBOT_R, True,
+                                 True)
+        self.assertTrue(report.accepted)
+        self.assertFalse(report.within_tolerance)
 
     def test_timeout(self):
         rig = Rig(AlignConfig(timeout_s=1.0))
@@ -202,6 +279,40 @@ class TestFailureModes(unittest.TestCase):
         self.assertTrue(rig.gate.accepted)
         rig.gate.reset(rig.now)
         self.assertFalse(rig.gate.accepted)
+
+
+class TestGuidanceText(unittest.TestCase):
+    """The `reason` string carries direction + closeness so a layman operator
+
+    on the headset (which just renders it verbatim, see TeleopHud.cs) has
+    something actionable to do with it."""
+
+    def test_guidance_names_the_far_wrist_and_direction(self):
+        rig = Rig()
+        rig.left = pose(0.15, 0.25 + 0.20, 0.45)   # 20cm further left than robot
+        rig.confirming = True
+        report = rig.step()
+        self.assertIn("L", report.reason)
+        self.assertIn("right", report.reason, "operator is left of target -> move right")
+
+    def test_guidance_only_names_wrists_out_of_tolerance(self):
+        rig = Rig()
+        rig.left = pose(0.15, 0.25, 0.45)          # in tolerance
+        rig.right = pose(0.15, -0.25, 1.10)        # 65cm off
+        rig.confirming = True
+        report = rig.step()
+        self.assertNotIn("L ", report.reason)
+        self.assertIn("R ", report.reason)
+
+    def test_guidance_omits_axes_under_a_centimetre(self):
+        rig = Rig()
+        rig.left = pose(0.15, 0.25, 0.45 + 0.20)   # pure up/down offset, 20cm
+        rig.confirming = True
+        report = rig.step()
+        self.assertNotIn("fwd", report.reason)
+        self.assertNotIn("back", report.reason)
+        self.assertNotIn("left", report.reason)
+        self.assertNotIn("right", report.reason)
 
 
 class TestTelemetry(unittest.TestCase):

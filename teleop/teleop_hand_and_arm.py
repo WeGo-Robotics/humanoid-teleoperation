@@ -443,8 +443,10 @@ if __name__ == '__main__':
                 else:
                     aligning = True
                     ALIGN.reset(time.monotonic())
-                    logger_mp.info("🧍 alignment — match the robot's arm pose, then "
-                                   "hold both pinches/triggers. [c] to cancel.")
+                    logger_mp.info("🧍 alignment — match the robot's arm pose (see HUD "
+                                   "guidance), then hold both pinches/triggers. Stuck? "
+                                   "hold both A/X too to skip the position check. "
+                                   "[c] to cancel.")
             elif not START and (was_following or aligning):
                 SAFETY.disarm(time.monotonic())
                 was_following = False
@@ -515,22 +517,37 @@ if __name__ == '__main__':
 
             # -------------------- START-ALIGNMENT GATE ------------------------
             # The arms stay frozen here. Following begins only once the host
-            # agrees (FK of the robot's own joints matches the operator's wrists)
-            # AND the operator agrees (two-handed gesture), both held together.
+            # agrees (FK of the robot's own joints matches the operator's
+            # wrists) AND the operator agrees (two-handed gesture), both held
+            # together -- OR the operator also holds both A/X buttons, which
+            # waives the host's position check for this hold (see
+            # teleop/safety/align.py). Either way the robot eases to the
+            # operator's live pose under the ordinary joint-velocity limiter
+            # in robot_arm.py afterward, never a snap.
             if aligning:
                 arm_ctrl.hold()
                 robot_l, robot_r = arm_ik.forward_kinematics(
                     arm_ctrl.get_current_dual_arm_q())
                 if robot_l is None and not _fk_warned:
-                    # Without FK the gate can never pass, and the operator would
-                    # otherwise just see alignment hang until it times out.
+                    # Without FK the guided path can never pass, and the
+                    # operator would otherwise just see alignment hang until
+                    # it times out -- point them at the skip instead.
                     _fk_warned = True
                     logger_mp.error("⛔ forward kinematics unavailable — alignment "
-                                    "cannot be verified and will not pass. Fix the "
-                                    "IK model, or use --skip-align at your own risk.")
+                                    "cannot be verified and will not pass unless the "
+                                    "operator holds both A/X to skip the position "
+                                    "check. Fix the IK model, or use --skip-align "
+                                    "at your own risk.")
+                # Both A/X buttons, held together with the confirm gesture,
+                # is the operator's in-VR escape hatch when the guided path
+                # will not converge (see docs §14.7 / align.py). Distinct
+                # from --skip-align: that CLI flag bypasses the whole gate,
+                # including the confirm gesture; this only waives the
+                # position check.
+                skip_requested = frame.left_ctrl_aButton and frame.right_ctrl_aButton
                 report = ALIGN.update(time.monotonic(), robot_l, robot_r,
                                       frame.left_wrist_pose, frame.right_wrist_pose,
-                                      frame.confirm_gesture)
+                                      frame.confirm_gesture, skip_requested)
                 ALIGN_STATE = report.as_dict()
 
                 # Mirror progress into the headset where the transport allows it
