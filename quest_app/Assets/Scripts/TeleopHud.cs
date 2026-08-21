@@ -41,7 +41,7 @@ namespace WeGo.Teleop
                  "The drop is derived from this and the panel's own height, " +
                  "rather than being a fixed distance, so the console stays " +
                  "hung off the horizon whatever size the layout grows to.")]
-        public float TopEdgeBelowHorizon = 3f;
+        public float TopEdgeBelowHorizon = 9f;
         [Tooltip("Seconds for the console to catch up. Non-zero so it does not " +
                  "feel welded to the face, which is a reliable way to make " +
                  "someone motion sick.")]
@@ -164,7 +164,14 @@ namespace WeGo.Teleop
                      + halfHeight;
 
             var target = headPos + forward * Distance + Vector3.down * drop;
-            var look = Quaternion.LookRotation(target - headPos, Vector3.up);
+
+            // Upright, not aimed at the eye. LookRotation(target - headPos)
+            // points the panel's normal along the head-to-panel vector, and
+            // once the panel hangs below eye level that vector slopes
+            // downward -- so the top leaned away from the operator and the
+            // bottom leaned toward them. Facing along the horizontal forward
+            // keeps the panel vertical and the text square.
+            var look = Quaternion.LookRotation(forward, Vector3.up);
 
             // Framerate-independent smoothing; a plain Lerp factor would make
             // the console lag differently at 72Hz and 90Hz.
@@ -202,9 +209,13 @@ namespace WeGo.Teleop
                 ? "Make sure your hands are inside the targets"
                 : "";
 
-            // The camera stream owns the stage whenever the host is sending
-            // one; the G1 model is what fills it until then.
-            var camera = Session.CameraTexture;
+            // The camera stream owns the stage only once alignment has
+            // passed. During ALIGN the operator is matching a posture, and the
+            // thing that helps them do that is the G1 in its reference pose --
+            // a view from the robot's head shows them neither their own hands
+            // nor the pose they are copying. The stream is what they need
+            // afterwards, when they are actually driving.
+            var camera = ShowsCamera(state) ? Session.CameraTexture : null;
             var wanted = camera != null ? camera
                        : (Stage != null ? Stage.Output : null);
             if (wanted != null && _stageImage.texture != wanted)
@@ -347,6 +358,16 @@ namespace WeGo.Teleop
                 case "DISCONNECTED": return "no link to the host";
                 default: return "—";
             }
+        }
+
+        /// <summary>Which states put the head camera on the stage. Only the
+        /// two in which the operator is driving the robot: before alignment
+        /// passes the stage belongs to the reference model, and in the stopped
+        /// and disconnected states a live view would suggest a control the
+        /// operator does not have.</summary>
+        private static bool ShowsCamera(string state)
+        {
+            return state == "FOLLOWING" || state == "HOLD";
         }
 
         private static Color ColourFor(string session, bool linked)
