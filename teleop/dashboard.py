@@ -1672,6 +1672,11 @@ class Dashboard(QWidget):
         img_ip = self.ed_camip.text().strip() or a.img_server_ip
         cmd = [sys.executable, script, "--ipc",
                "--xr-source", "xrlink",
+               # Device telemetry is recorded on every launch. The app-side
+               # defects so far were all found after the session ended, by
+               # which point nothing had been captured; a session that is not
+               # recorded is a session that has to be run again.
+               "--xr-log",
                "--input-mode", input_mode,
                "--arm", a.arm,
                "--img-server-ip", img_ip]

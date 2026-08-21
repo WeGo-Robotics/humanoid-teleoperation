@@ -58,16 +58,21 @@ class LinkSnapshot:
 
 class XrLinkServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 8443,
-                 ssl_context=None, on_estop=None):
+                 ssl_context=None, on_estop=None, recorder=None):
         """`ssl_context` should be a real one in production; tests use plain ws.
 
         `on_estop` is invoked from the server thread when the device requests an
         emergency stop, so it must be cheap and thread-safe.
+
+        `recorder` is an optional `link_recorder.LinkRecorder`. It observes; it
+        never feeds the snapshot, so a recorder that throws or falls behind can
+        degrade the evidence but not the control path.
         """
         self._host = host
         self._port = port
         self._ssl = ssl_context
         self._on_estop = on_estop
+        self._recorder = recorder
 
         self._lock = threading.Lock()
         self._snap = LinkSnapshot()
@@ -167,6 +172,9 @@ class XrLinkServer:
         logger_mp.info(f"[XrLink] device connected: {peer}")
         with self._lock:
             self._snap = LinkSnapshot(connected=True)
+        if self._recorder is not None:
+            self._recorder.event("connected", peer=str(peer),
+                                 superseded=previous is not None)
 
         try:
             async for message in ws:
@@ -175,6 +183,12 @@ class XrLinkServer:
             logger_mp.warning(f"[XrLink] connection error: {e!r}")
         finally:
             logger_mp.warning(f"[XrLink] device disconnected: {peer}")
+            if self._recorder is not None:
+                # Summarize here rather than only on the period boundary: a
+                # session that drops after ten seconds still has to leave a
+                # verdict behind, because that is the session worth reading.
+                self._recorder.event("disconnected", peer=str(peer))
+                self._recorder.flush_summary()
             if self._client is ws:
                 self._client = None
                 # session_up goes false immediately. The safety layer treats
@@ -204,6 +218,8 @@ class XrLinkServer:
             # Rate-limited: a version mismatch would otherwise log at 90Hz.
             if self._snap.decode_errors % 100 == 1:
                 logger_mp.error(f"[XrLink] bad tracking frame: {e}")
+            if self._recorder is not None:
+                self._recorder.event("decode_error", error=str(e))
             return
 
         now = time.monotonic()
@@ -217,6 +233,13 @@ class XrLinkServer:
             self._snap = replace(prev, frame=frame, rx_monotonic=now,
                                  seq=frame.seq, dropped=dropped,
                                  worn=frame.worn)
+            decode_errors = prev.decode_errors
+
+        # Outside the lock: the recorder does file I/O, and the control loop
+        # reads the snapshot under this same lock at 30 Hz.
+        if self._recorder is not None:
+            self._recorder.tracking(frame, now, dropped=dropped,
+                                    decode_errors=decode_errors)
 
     def _on_control(self, text):
         try:
@@ -249,6 +272,26 @@ class XrLinkServer:
                     battery=float(battery) if battery is not None else None)
             elif kind == "estop":
                 self._snap = replace(self._snap, estop_requested=True)
+
+        if self._recorder is not None:
+            # Every control message, not just the ones that changed state: the
+            # finding in docs 14.2 defect 3 was an *absence*, and an absence is
+            # only evidence if the presence would have been recorded.
+            if kind == "buttons":
+                self._recorder.event("buttons",
+                                     pressed=list(msg.get("pressed") or ()),
+                                     unknown=list(unknown))
+            elif kind == "hello":
+                self._recorder.event("hello", dev=msg.get("dev"),
+                                     proto=msg.get("proto"))
+            elif kind == "presence":
+                self._recorder.event("presence", worn=bool(msg.get("worn")))
+            elif kind == "status":
+                self._recorder.event("status", battery=msg.get("battery"))
+            elif kind == "estop":
+                self._recorder.event("estop")
+            else:
+                self._recorder.event("control", kind=str(kind))
 
         if unknown:
             # Not fatal -- the known buttons in the same message were kept -- but

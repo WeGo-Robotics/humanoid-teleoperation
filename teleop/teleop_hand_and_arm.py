@@ -131,6 +131,14 @@ if __name__ == '__main__':
                         help = 'XR transport: vuer (browser, default) or xrlink (native app)')
     parser.add_argument('--xrlink-port', type = int, default = 8443,
                         help = 'XrLink websocket port when --xr-source=xrlink')
+    parser.add_argument('--xr-log', type = str, default = None, nargs = '?',
+                        const = 'auto',
+                        help = 'Record what the device sends to a JSONL file, for '
+                               'later analysis with `python -m teleop.xr.link_recorder '
+                               '<file>`. Bare flag picks logs/xrlink-<timestamp>.jsonl')
+    parser.add_argument('--xr-log-hz', type = float, default = 10.0,
+                        help = 'Pose sample rate written to --xr-log (0 = every frame). '
+                               'Summaries and events are never decimated')
     parser.add_argument('--no-xr-video', dest = 'xr_video', action = 'store_false',
                         help = 'Do not stream the head camera to the XR device. '
                                'Video shares the control socket, so turn it off '
@@ -217,11 +225,26 @@ if __name__ == '__main__':
         # XR source. Everything below this point talks to `xr`, never to a
         # specific device -- see teleop/xr. Swapping the browser transport for
         # the native app is this one branch.
+        # Defined on both transports: the `finally` block closes it, and the
+        # vuer path must not raise NameError on the way out.
+        xr_recorder = None
         if args.xr_source == "xrlink":
             from teleop.xr.link_server import XrLinkServer
             from teleop.xr.native_source import NativeXRSource
+            # Device telemetry recorder. Every app-side defect so far was found
+            # by measuring the wire after the fact; this writes the measurement
+            # while the session is still running. See teleop/xr/link_recorder.py.
+            if args.xr_log:
+                from teleop.xr.link_recorder import LinkRecorder
+                xr_log_path = args.xr_log
+                if xr_log_path == 'auto':
+                    xr_log_path = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), 'logs',
+                        time.strftime('xrlink-%Y%m%d-%H%M%S.jsonl'))
+                xr_recorder = LinkRecorder(xr_log_path, hz=args.xr_log_hz)
             link = XrLinkServer(port=args.xrlink_port,
-                                on_estop=lambda: SAFETY.estop(time.monotonic(), "device"))
+                                on_estop=lambda: SAFETY.estop(time.monotonic(), "device"),
+                                recorder=xr_recorder)
             if not link.start():
                 raise RuntimeError("XrLink server failed to start")
             xr = NativeXRSource(link)
@@ -872,6 +895,14 @@ if __name__ == '__main__':
             xr.close()
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
+
+        try:
+            # After xr.close(), so the last frames are in the file before the
+            # final summary is computed from them.
+            if xr_recorder is not None:
+                xr_recorder.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close XR recorder: {e}")
 
         try:
             # debug(상체) mode: restore ai mode on exit so the remote controller
