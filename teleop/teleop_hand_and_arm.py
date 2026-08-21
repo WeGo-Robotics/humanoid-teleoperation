@@ -131,6 +131,16 @@ if __name__ == '__main__':
                         help = 'XR transport: vuer (browser, default) or xrlink (native app)')
     parser.add_argument('--xrlink-port', type = int, default = 8443,
                         help = 'XrLink websocket port when --xr-source=xrlink')
+    parser.add_argument('--no-xr-video', dest = 'xr_video', action = 'store_false',
+                        help = 'Do not stream the head camera to the XR device. '
+                               'Video shares the control socket, so turn it off '
+                               'if the link is marginal -- the session works '
+                               'without it, and control must never queue behind it')
+    parser.add_argument('--xr-video-fps', type = float, default = 20.0,
+                        help = 'Upper bound on head-camera frames sent to the XR device')
+    parser.add_argument('--xr-video-width', type = int, default = 640,
+                        help = 'Head-camera frames wider than this are scaled down '
+                               'before being sent to the XR device')
     # start-alignment gate
     parser.add_argument('--align-pos-tol', type = float, default = 0.10,
                         help = 'Per-wrist position tolerance for the start-alignment gate (m)')
@@ -216,6 +226,21 @@ if __name__ == '__main__':
                 raise RuntimeError("XrLink server failed to start")
             xr = NativeXRSource(link)
             tv_wrapper = None
+
+            # Head camera to the headset's console. The browser transport did
+            # this through TeleVuer; on this path the device had no live view
+            # at all. Lossy and out-of-band by design -- see teleop/xr/
+            # video_pump.py for why video must never be able to delay the
+            # control channel it shares.
+            if args.xr_video:
+                from teleop.xr.video_pump import VideoPump
+                video_pump = VideoPump(
+                    get_frame=lambda: img_client.get_head_frame()[0],
+                    send=link.send_video,
+                    fps=args.xr_video_fps,
+                    width=args.xr_video_width,
+                )
+                video_pump.start()
         else:
             from teleop.xr.vuer_source import VuerXRSource
             # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.

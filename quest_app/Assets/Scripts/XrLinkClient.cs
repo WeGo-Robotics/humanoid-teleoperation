@@ -11,6 +11,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -116,6 +117,16 @@ namespace WeGo.Teleop
                 var result = await _socket.ReceiveAsync(
                     new ArraySegment<byte>(buffer), token);
                 if (result.MessageType == WebSocketMessageType.Close) return;
+
+                // Binary is a JPEG from the robot's head camera. Unlike the
+                // control messages below, these DO fragment an 8KB buffer --
+                // a frame is tens of kilobytes -- so they are reassembled
+                // rather than dropped.
+                if (result.MessageType == WebSocketMessageType.Binary)
+                {
+                    await ReceiveFrameAsync(buffer, result, token);
+                    continue;
+                }
                 if (result.MessageType != WebSocketMessageType.Text) continue;
 
                 if (!result.EndOfMessage)
@@ -132,6 +143,58 @@ namespace WeGo.Teleop
                     continue;
                 }
                 Inbound.Enqueue(Encoding.UTF8.GetString(buffer, 0, result.Count));
+            }
+        }
+
+        /// <summary>Latest complete JPEG from the head camera, or null.
+        ///
+        /// One slot, not a queue: a frame that arrived while the last one was
+        /// still being uploaded to the GPU is stale the moment the next
+        /// arrives, and queueing them would build latency into a video feed
+        /// whose whole value is being current. Late frames replace early ones.
+        /// </summary>
+        public byte[] TakeFrame() => Interlocked.Exchange(ref _frame, null);
+
+        public int FramesReceived => _framesReceived;
+        public int FramesDropped => _framesDropped;
+
+        private byte[] _frame;
+        private int _framesReceived, _framesDropped;
+
+        // A frame that needs more than this is not one this app asked for.
+        // Bounded so a confused or hostile sender cannot grow the buffer until
+        // the headset runs out of memory.
+        private const int MaxFrameBytes = 2 * 1024 * 1024;
+
+        private async Task ReceiveFrameAsync(byte[] buffer,
+                                             WebSocketReceiveResult result,
+                                             CancellationToken token)
+        {
+            using (var stream = new MemoryStream(1 << 16))
+            {
+                var oversized = false;
+                while (true)
+                {
+                    if (stream.Length + result.Count > MaxFrameBytes) oversized = true;
+                    else stream.Write(buffer, 0, result.Count);
+
+                    if (result.EndOfMessage) break;
+                    if (token.IsCancellationRequested) return;
+                    result = await _socket.ReceiveAsync(
+                        new ArraySegment<byte>(buffer), token);
+                    if (result.MessageType == WebSocketMessageType.Close) return;
+                }
+
+                if (oversized)
+                {
+                    Interlocked.Increment(ref _framesDropped);
+                    Debug.LogWarning($"[XrLink] camera frame over {MaxFrameBytes} bytes, dropped");
+                    return;
+                }
+
+                if (Interlocked.Exchange(ref _frame, stream.ToArray()) != null)
+                    Interlocked.Increment(ref _framesDropped);
+                Interlocked.Increment(ref _framesReceived);
             }
         }
 

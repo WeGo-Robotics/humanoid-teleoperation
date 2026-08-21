@@ -202,12 +202,60 @@ namespace WeGo.Teleop
         // ------------------------------------------------------------------
         // per-frame
         // ------------------------------------------------------------------
+        /// <summary>Latest head-camera frame, or null when the host is not
+        /// sending one. TeleopHud puts this on the console's stage in place of
+        /// the G1 model.</summary>
+        public Texture2D CameraTexture { get; private set; }
+
+        public int CameraFrames { get; private set; }
+
+        private float _lastFrameAt;
+
+        /// <summary>How long a frame stays on screen after the stream stops.
+        /// A frozen picture of where the robot used to be looking is worse
+        /// than no picture, because it does not announce itself -- so the
+        /// stage falls back to the model rather than holding the last
+        /// frame.</summary>
+        private const float FrameStaleAfter = 2.0f;
+
+        private void PollCameraFrames()
+        {
+            var jpeg = _link?.TakeFrame();
+            if (jpeg != null)
+            {
+                if (CameraTexture == null)
+                {
+                    // Mipmaps off: this is displayed at roughly 1:1 on a flat
+                    // panel and never minified, so they would cost memory and
+                    // an upload every frame for nothing.
+                    CameraTexture = new Texture2D(2, 2, TextureFormat.RGB24, false)
+                    {
+                        wrapMode = TextureWrapMode.Clamp,
+                        filterMode = FilterMode.Bilinear,
+                    };
+                }
+                // LoadImage resizes the texture to the JPEG's own dimensions.
+                if (CameraTexture.LoadImage(jpeg, false))
+                {
+                    CameraFrames++;
+                    _lastFrameAt = Time.unscaledTime;
+                }
+            }
+
+            if (CameraTexture != null && Time.unscaledTime - _lastFrameAt > FrameStaleAfter)
+            {
+                Destroy(CameraTexture);
+                CameraTexture = null;
+            }
+        }
+
         private void Update()
         {
             // The preview driver owns every field the UI reads. Falling through
             // here would immediately stamp DISCONNECTED over it.
             if (Offline) return;
 
+            PollCameraFrames();
             DrainHostMessages();
 
             LinkConnected = _link != null && _link.IsConnected;
