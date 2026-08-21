@@ -42,6 +42,10 @@ namespace WeGo.Teleop
                  "rather than being a fixed distance, so the console stays " +
                  "hung off the horizon whatever size the layout grows to.")]
         public float TopEdgeBelowHorizon = 9f;
+        [Tooltip("Additional drop, in multiples of the panel's own height. " +
+                 "Expressed this way so it keeps its meaning if the layout " +
+                 "changes size.")]
+        public float ExtraDropInPanelHeights = 0.5f;
         [Tooltip("Seconds for the console to catch up. Non-zero so it does not " +
                  "feel welded to the face, which is a reliable way to make " +
                  "someone motion sick.")]
@@ -159,9 +163,12 @@ namespace WeGo.Teleop
             // of a 1.18 m console fifteen degrees ABOVE the eye line, which is
             // what made it read as too high -- and it would drift again every
             // time the layout changed height.
+            // Half the panel's height again below the angle above. The plain
+            // top-edge rule still left it reading as too high in the headset,
+            // and this is the offset that was asked for after trying it.
             var halfHeight = H * MetresPerUnit * 0.5f;
             var drop = Distance * Mathf.Tan(TopEdgeBelowHorizon * Mathf.Deg2Rad)
-                     + halfHeight;
+                     + halfHeight + halfHeight * ExtraDropInPanelHeights * 2f;
 
             var target = headPos + forward * Distance + Vector3.down * drop;
 
@@ -206,7 +213,7 @@ namespace WeGo.Teleop
                 : Session.AlignReason;
 
             _sub.text = aligning
-                ? "Make sure your hands are inside the targets"
+                ? "Hands inside the targets  ·  both grips to confirm  ·  X + A together to skip"
                 : "";
 
             // The camera stream owns the stage only once alignment has
@@ -221,9 +228,24 @@ namespace WeGo.Teleop
             if (wanted != null && _stageImage.texture != wanted)
             {
                 _stageImage.texture = wanted;
+
+                // The model is shown mirrored, the camera is not.
+                //
+                // The stage camera views the robot from the front, so without
+                // this the operator's left hand appears on the right of the
+                // panel and every correction has to be mentally reversed --
+                // which is what made aligning against it so hard. Flipping the
+                // model makes the panel behave like a mirror, where a hand
+                // moved left moves left. The head camera must never be
+                // flipped: it is a view of the world, and mirroring it would
+                // send the operator the wrong way round an obstacle.
+                _stageImage.uvRect = camera != null
+                    ? new Rect(0f, 0f, 1f, 1f)
+                    : new Rect(1f, 0f, -1f, 1f);
+
                 _stageCaption.text = camera != null
                     ? "head camera · live"
-                    : "reference pose · rings are your wrist targets";
+                    : "mirror view · rings are your wrist targets";
             }
 
             var p = Mathf.Clamp01(Session.AlignProgress);
@@ -292,7 +314,7 @@ namespace WeGo.Teleop
             SetCheck(3, left);
             SetCheck(4, right);
             SetCheck(5, Session.ConfirmHeld);
-            SetCheck(6, Session.AlignWithinTolerance || Session.SkipLatched);
+            SetCheck(6, Session.AlignWithinTolerance || Session.SkipHeld);
         }
 
         /// <summary>Angle-based, matching TeleopAlignGuide, so "in view" on the
@@ -325,8 +347,8 @@ namespace WeGo.Teleop
             _confirmFill.color = frac >= 0.999f ? Green : Amber;
             _confirmLabel.color = holding ? White : GreenHi;
 
-            _skipFillRect.sizeDelta = new Vector2(Session.SkipLatched ? HoldW : 0f, HoldH);
-            _skipLabel.color = Session.SkipLatched ? Amber : GreenHi;
+            _skipFillRect.sizeDelta = new Vector2(Session.SkipHeld ? HoldW : 0f, HoldH);
+            _skipLabel.color = Session.SkipHeld ? Amber : GreenHi;
         }
 
         private void RenderWave(bool aligning)
@@ -647,7 +669,7 @@ namespace WeGo.Teleop
                                      "HOLD CONFIRM  (grips)", out _confirmLabel,
                                      out _confirmFillRect);
             _skipFill = BuildHold(root, new Vector2(StageX + HoldW + 16f, holdsTop),
-                                  "HOLD SKIP  (A / X)", out _skipLabel, out _skipFillRect);
+                                  "HOLD SKIP  (X + A)", out _skipLabel, out _skipFillRect);
 
             _reason = Label(root, 22, FontStyle.Normal, GreenLo, TextAnchor.MiddleLeft,
                             new Vector2(StageX + 2f * HoldW + 44f, holdsTop),

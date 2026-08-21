@@ -238,7 +238,7 @@ namespace WeGo.Teleop
             // The device reads these off the grips and A/X in PollButtons;
             // offline that path never runs, so the driver supplies them.
             Session.ConfirmHeld = confirming;
-            Session.SkipLatched = _skipLatched;
+            Session.SkipHeld = _skipLatched;
             if (skip && !_skipLatched) _skipLatched = true;
 
             var gate = confirming && (within || _skipLatched);

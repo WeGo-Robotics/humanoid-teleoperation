@@ -57,13 +57,23 @@ namespace WeGo.Teleop
         public bool HasAlignTargets;
         public bool AlignWithinTolerance;
 
-        /// <summary>Both grips held, and A/X pressed at least once this
-        /// alignment. Read locally rather than echoed back from the host: the
-        /// checklist has to respond the instant the operator squeezes, and a
-        /// round trip through the host would make it lag by a message. Nothing
-        /// gates on these -- the host still decides.</summary>
+        /// <summary>Both grips held; and X and A held together. Read locally
+        /// rather than echoed back from the host, because the checklist has to
+        /// respond the instant the operator squeezes and a round trip would
+        /// make it lag by a message. Nothing gates on these -- the host still
+        /// decides.
+        ///
+        /// SkipHeld requires BOTH face buttons and is not latched, because
+        /// that is exactly what the host tests:
+        ///
+        ///     skip_requested = frame.left_ctrl_aButton and frame.right_ctrl_aButton
+        ///
+        /// evaluated fresh every cycle. An earlier version latched on either
+        /// button, so the checklist reported the position check waived while
+        /// the host was still refusing to skip -- the feature looked broken
+        /// when it was the readout that was wrong.</summary>
         public bool ConfirmHeld;
-        public bool SkipLatched;
+        public bool SkipHeld;
         public float LeftPosError = float.PositiveInfinity;
         public float RightPosError = float.PositiveInfinity;
 
@@ -305,13 +315,10 @@ namespace WeGo.Teleop
             Collect(LeftDevice(), CommonUsages.primary2DAxisClick, "left_thumb");
             Collect(RightDevice(), CommonUsages.primary2DAxisClick, "right_thumb");
 
-            // Local mirrors for the checklist. SkipLatched is cleared when the
-            // host leaves ALIGN, so a waiver granted in one alignment does not
-            // silently carry into the next one.
+            // Local mirrors for the checklist, matching what the host tests.
             ConfirmHeld = GetButton(LeftDevice(), CommonUsages.gripButton)
                        && GetButton(RightDevice(), CommonUsages.gripButton);
-            if (_pressed.Contains("left_a") || _pressed.Contains("right_a")) SkipLatched = true;
-            if (SessionState != "ALIGN") SkipLatched = false;
+            SkipHeld = _pressed.Contains("left_a") && _pressed.Contains("right_a");
 
             var key = string.Join(",", _pressed);
             var due = Time.unscaledTime - _lastButtonSend >= ButtonResendInterval;
