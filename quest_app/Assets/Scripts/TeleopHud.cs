@@ -1,28 +1,27 @@
 // The in-headset align console.
 //
-// Renders what TeleopSession has been told by the host, and nothing else. It
-// holds no state of its own and makes no decisions -- if you find yourself
-// wanting to add a condition here that changes behaviour rather than colour,
-// it belongs on the host.
+// This is the layout from hud_console_preview, reproduced rather than
+// reinterpreted: corner brackets, facing line, posture line, then three
+// columns -- Overall Alignment / Alignment Checklist / Tip on the left, the
+// stage with its align bar and hold prompts in the middle, Joint Guide / Voice
+// Guide / E-Stop on the right.
 //
-// Layout is the console from the design mock, adapted rather than copied. Two
-// things in that mock do not survive the move into a headset:
+// The centre stage is the important one. It is a RawImage fed by TeleopStage,
+// and it exists to be replaced: when the robot's camera stream arrives, call
+// SetStageTexture with the video texture and the rest of the console is
+// unchanged. An earlier version of this file dropped the stage on the grounds
+// that a viewport of the operator duplicated the room. That was wrong -- the
+// panel is the stream's home, and the mirror figure is a placeholder in it.
 //
-//   * the 3D stage. The mock had to draw the operator's body and the wrist
-//     targets in a viewport, because it was a web page. In here the operator
-//     IS in the scene and TeleopAlignGuide draws the rings in the actual room.
-//     Reproducing the stage would be a picture of where you are, next to
-//     where you are.
-//   * the buttons. HOLD CONFIRM and HOLD SKIP are the grips and A/X. A panel
-//     you cannot press is worse than no panel, so they read as prompts.
-//
-// Everything else is here: the gauge, the readiness checklist, the align bar,
-// the reference figure, the posture line and the e-stop reminder.
+// Two things from the mock are prompts here rather than controls: HOLD CONFIRM
+// and HOLD SKIP. They are the grips and A/X. There is no pointer in this app,
+// so a button you cannot press would be worse than a label that tells you
+// which control to hold -- but they still show their hold progress, because
+// that is the part the operator actually needs.
 //
 // Built in code rather than as a prefab for the same reason the scene is; see
 // the header of TeleopBootstrap. Every element uses a point anchor and an
-// explicit size, so positions read as plain numbers in a 1780x780 panel rather
-// than as interacting anchor/pivot/offset rules.
+// explicit size, so positions read as plain numbers in a 1780x1240 panel.
 
 using UnityEngine;
 using UnityEngine.UI;
@@ -33,14 +32,15 @@ namespace WeGo.Teleop
     {
         public TeleopSession Session;
         public Transform Anchor;
+        public TeleopStage Stage;
 
         [Header("Placement")]
         [Tooltip("Metres in front of the head.")]
-        public float Distance = 1.15f;
-        [Tooltip("Metres below eye level. Kept low so the console is not in " +
-                 "the way of the arms the operator is watching, but not so low " +
-                 "that reading it means looking away from them.")]
-        public float Drop = 0.34f;
+        public float Distance = 1.45f;
+        [Tooltip("Metres below eye level. The console is tall, so this is a " +
+                 "small drop -- enough to keep the horizon clear without " +
+                 "pushing the top of the panel out of view.")]
+        public float Drop = 0.18f;
         [Tooltip("Seconds for the console to catch up. Non-zero so it does not " +
                  "feel welded to the face, which is a reliable way to make " +
                  "someone motion sick.")]
@@ -49,34 +49,33 @@ namespace WeGo.Teleop
         // ------------------------------------------------------------------
         // geometry, in panel units
         // ------------------------------------------------------------------
-        private const float W = 1780f, H = 780f;
-        private const float Pad = 28f;
-        private const float ColTop = -118f;
+        private const float W = 1780f, H = 1240f;
+        private const float Pad = 30f;
+        private const float ColTop = -126f;
         private const float SideW = 400f;
-        private const float CentreX = 452f, CentreW = 876f;
+        private const float StageX = 452f, StageW = 876f;
         private const float RightX = 1348f;
+        private const float Gap = 16f;
 
-        // 1780 units at 0.00075 m/unit is a 1.34m console; at 1.15m that
-        // subtends about 60 degrees across and 28 down.
+        // 1780 units at 0.00095 m/unit is a 1.69m console; at 1.45m that
+        // subtends about 62 degrees across and 45 down.
         //
-        // That is large, and it is sized from legibility rather than taste. A
-        // Quest 3 resolves roughly 20 pixels per degree, so a panel unit is
-        // worth 60 * 20.6 / 1780 = 0.7 device pixels. Body text at 27 units
-        // therefore lands at about 19 pixels tall, which is the floor for
-        // comfortable reading through the optics. The first version of this
-        // console was half the size, which put body text at 10 pixels: it
-        // looked correct on a monitor and was unreadable in the headset. If
-        // you shrink this, shrink the content first.
-        private const float MetresPerUnit = 0.00075f;
+        // That is a large HUD, and it is sized from legibility rather than
+        // taste. A Quest 3 resolves roughly 20 pixels per degree, so a panel
+        // unit is worth 62 * 20.6 / 1780 = 0.72 device pixels and the smallest
+        // text here lands at about 17 px. Going smaller means cutting content,
+        // not shrinking type -- this layout is already at the floor. The
+        // console only occupies the view during alignment; FOLLOWING is when
+        // the operator needs the room, and by then it is the only thing up.
+        private const float MetresPerUnit = 0.00095f;
 
-        // The gate's tolerance, for the checklist's per-hand rows. Display
-        // only: what actually gates is AlignWithinTolerance off the host.
         private const float PosTolerance = 0.10f;
+        private const float HalfFovH = 44f, HalfFovV = 38f;
 
         // ------------------------------------------------------------------
         // palette -- from the design mock
         // ------------------------------------------------------------------
-        private static readonly Color ConsoleBg = new Color(0.024f, 0.051f, 0.039f, 0.93f);
+        private static readonly Color ConsoleBg = new Color(0.024f, 0.051f, 0.039f, 0.94f);
         private static readonly Color PanelBg = new Color(0.035f, 0.094f, 0.067f, 0.62f);
         private static readonly Color Green = new Color(0.235f, 0.878f, 0.490f);
         private static readonly Color GreenHi = new Color(0.553f, 1.000f, 0.741f);
@@ -93,10 +92,14 @@ namespace WeGo.Teleop
         private Transform _panel;
         private Font _font;
 
-        private Text _facing, _posture, _pill, _message, _sub, _link, _reason;
-        private Text _gaugePct, _gaugeTier, _gaugeMsg;
-        private Image _pillBorder, _gaugeFill, _barFill, _barTrack;
-        private RectTransform _barFillRect;
+        private Text _facing, _posture, _pill, _message, _sub, _reason, _link;
+        private Text _gaugePct, _gaugeTier, _gaugeMsg, _voice;
+        private Image _pillBorder, _gaugeFill;
+        private RawImage _stageImage;
+        private Image _confirmFill, _skipFill;
+        private Text _confirmLabel, _skipLabel;
+        private RectTransform _confirmFillRect, _skipFillRect;
+        private Image[] _wave;
         private Check[] _checks;
 
         private struct Check
@@ -109,12 +112,16 @@ namespace WeGo.Teleop
         private void Start()
         {
             Build();
-            Debug.Log($"[Teleop] hud built: panel={_panel.position} " +
-                      $"rect={((RectTransform)_panel).sizeDelta} " +
-                      $"scale={_panel.localScale.x} " +
-                      $"graphics={_panel.GetComponentsInChildren<Graphic>(true).Length} " +
-                      $"anchor={(Anchor != null ? Anchor.name : "null")} " +
-                      $"mainCam={(Camera.main != null ? Camera.main.name : "null")}");
+            Debug.Log($"[Teleop] console built: graphics=" +
+                      $"{_panel.GetComponentsInChildren<Graphic>(true).Length} " +
+                      $"stage={(Stage != null ? "yes" : "no")}");
+        }
+
+        /// <summary>Point the stage panel at a different texture. This is the
+        /// entire integration surface for the robot's camera stream.</summary>
+        public void SetStageTexture(Texture texture)
+        {
+            if (_stageImage != null) _stageImage.texture = texture;
         }
 
         private void LateUpdate()
@@ -129,18 +136,23 @@ namespace WeGo.Teleop
         // ------------------------------------------------------------------
         private void Follow()
         {
-            var head = Anchor != null ? Anchor : transform;
+            // Head pose comes from the session, not from Anchor.transform.
+            // Anchor is an OVRCameraRig anchor, and on this headset OVRPlugin
+            // leaves it at identity -- which froze both the follow and the
+            // facing readout.
+            var headPos = Session.HeadPosition;
+            var headRot = Session.HeadRotation;
 
             // Yaw only. Following pitch means the console climbs out of view
             // when the operator looks down at their hands, which is exactly
             // when they most want to read it.
-            var forward = head.forward;
+            var forward = headRot * Vector3.forward;
             forward.y = 0f;
             if (forward.sqrMagnitude < 1e-4f) forward = Vector3.forward;
             forward.Normalize();
 
-            var target = head.position + forward * Distance + Vector3.down * Drop;
-            var look = Quaternion.LookRotation(target - head.position, Vector3.up);
+            var target = headPos + forward * Distance + Vector3.down * Drop;
+            var look = Quaternion.LookRotation(target - headPos, Vector3.up);
 
             // Framerate-independent smoothing; a plain Lerp factor would make
             // the console lag differently at 72Hz and 90Hz.
@@ -155,18 +167,16 @@ namespace WeGo.Teleop
         // ------------------------------------------------------------------
         private void Render()
         {
-            var state = string.IsNullOrEmpty(Session.SessionState)
-                ? "—" : Session.SessionState;
+            var state = string.IsNullOrEmpty(Session.SessionState) ? "—" : Session.SessionState;
             var colour = ColourFor(state, Session.LinkConnected);
             var aligning = state == "ALIGN";
 
-            var head = Anchor != null ? Anchor : transform;
-            var e = head.rotation.eulerAngles;
-            _facing.text = $"FACING {Mathf.RoundToInt(Mathf.DeltaAngle(0f, e.y))}°   ·   " +
-                           $"PITCH {-Mathf.RoundToInt(Mathf.DeltaAngle(0f, e.x))}°";
+            var e = Session.HeadRotation.eulerAngles;
+            _facing.text = $"facing {Mathf.RoundToInt(Mathf.DeltaAngle(0f, e.y))}°   ·   " +
+                           $"pitch {-Mathf.RoundToInt(Mathf.DeltaAngle(0f, e.x))}°";
 
             _posture.text = aligning ? "HUMANOID POSTURE: STANDING G1"
-                                     : "HUMANOID POSTURE: LIVE";
+                                     : $"HUMANOID POSTURE: {state}";
 
             _pill.text = state;
             _pill.color = colour;
@@ -177,31 +187,29 @@ namespace WeGo.Teleop
                 : Session.AlignReason;
 
             _sub.text = aligning
-                ? "A / X waives the position check   ·   both grips to confirm"
+                ? "Make sure your hands are inside the targets"
                 : "";
 
-            // The bar is only meaningful during alignment. At any other time a
-            // progress bar sitting at zero reads as "stuck", not "not running",
-            // so the track goes away entirely rather than sitting there empty.
             var p = Mathf.Clamp01(Session.AlignProgress);
-            _barTrack.gameObject.SetActive(aligning);
-            if (aligning)
-            {
-                _barFillRect.sizeDelta = new Vector2((CentreW - 2f * Pad) * p, 22f);
-                _barFill.color = p >= 0.999f ? Green : Amber;
-            }
-
             RenderGauge(aligning ? p : 0f, aligning);
             RenderChecks(aligning);
+            RenderHolds(aligning, p);
+            RenderWave(aligning);
+
+            _voice.text = aligning
+                ? (string.IsNullOrEmpty(Session.AlignReason)
+                    ? "Bring both hands forward to the rings."
+                    : Session.AlignReason)
+                : DefaultMessage(state);
+
+            _reason.text = $"align.reason = \"{Session.AlignReason}\"";
 
             _link.text = Session.LinkConnected
                 ? (Session.SkippedFrames > 0
-                    ? $"link up   ·   {Session.HostUrl}   ·   {Session.SkippedFrames} frames skipped"
+                    ? $"link up   ·   {Session.HostUrl}   ·   {Session.SkippedFrames} skipped"
                     : $"link up   ·   {Session.HostUrl}")
                 : $"no link   ·   retrying   ·   {Session.HostUrl}";
             _link.color = Session.LinkConnected ? Dim : Red;
-
-            _reason.text = $"align.reason = \"{Session.AlignReason}\"";
         }
 
         private void RenderGauge(float p, bool aligning)
@@ -212,8 +220,7 @@ namespace WeGo.Teleop
             if (!aligning)
             {
                 // Not "0%". A gauge reading zero says the alignment is failing;
-                // what is true is that no alignment is running, and a dash says
-                // that without inventing a number.
+                // what is true is that none is running.
                 _gaugePct.text = "—";
                 _gaugePct.color = Dim;
                 _gaugeTier.text = "IDLE";
@@ -232,7 +239,7 @@ namespace WeGo.Teleop
             else { _gaugeTier.text = "FAR"; _gaugeTier.color = Red; }
 
             _gaugeMsg.text = Session.HasAlignTargets
-                ? "Put both hands through the rings."
+                ? "Bring both hands to the rings."
                 : "Waiting for the robot's pose.";
             _gaugeMsg.color = Session.HasAlignTargets ? Green : Amber;
         }
@@ -243,13 +250,23 @@ namespace WeGo.Teleop
             var left = Session.LeftPosError <= PosTolerance;
             var right = Session.RightPosError <= PosTolerance;
 
-            SetCheck(0, Session.LinkConnected);
-            SetCheck(1, tracked);
-            SetCheck(2, Session.HasAlignTargets);
+            SetCheck(0, tracked);
+            SetCheck(1, Session.HasAlignTargets && InView(Session.LeftAlignTarget));
+            SetCheck(2, Session.HasAlignTargets && InView(Session.RightAlignTarget));
             SetCheck(3, left);
             SetCheck(4, right);
-            SetCheck(5, Session.AlignWithinTolerance);
-            SetCheck(6, !aligning && Session.LinkConnected);
+            SetCheck(5, Session.ConfirmHeld);
+            SetCheck(6, Session.AlignWithinTolerance || Session.SkipLatched);
+        }
+
+        /// <summary>Angle-based, matching TeleopAlignGuide, so "in view" on the
+        /// checklist means the same thing as a ring rather than a chevron.</summary>
+        private bool InView(Vector3 world)
+        {
+            var local = Quaternion.Inverse(Session.HeadRotation) * (world - Session.HeadPosition);
+            if (local.z <= 0.01f) return false;
+            return Mathf.Abs(Mathf.Atan2(local.x, local.z) * Mathf.Rad2Deg) < HalfFovH
+                && Mathf.Abs(Mathf.Atan2(local.y, local.z) * Mathf.Rad2Deg) < HalfFovV;
         }
 
         private void SetCheck(int i, bool on)
@@ -260,10 +277,36 @@ namespace WeGo.Teleop
             c.Tick.color = on ? new Color(0.016f, 0.094f, 0.051f) : Color.clear;
         }
 
+        private void RenderHolds(bool aligning, float p)
+        {
+            // The confirm prompt fills as the hold accumulates. Progress past
+            // the gate's 85% mark is the hold timer, so that is the part shown
+            // here -- below it the bar would be reporting how far the hands
+            // are, which the gauge already does.
+            var holding = aligning && Session.ConfirmHeld;
+            var frac = holding ? Mathf.Clamp01((p - 0.85f) / 0.15f) : 0f;
+            _confirmFillRect.sizeDelta = new Vector2(HoldW * frac, HoldH);
+            _confirmFill.color = frac >= 0.999f ? Green : Amber;
+            _confirmLabel.color = holding ? White : GreenHi;
+
+            _skipFillRect.sizeDelta = new Vector2(Session.SkipLatched ? HoldW : 0f, HoldH);
+            _skipLabel.color = Session.SkipLatched ? Amber : GreenHi;
+        }
+
+        private void RenderWave(bool aligning)
+        {
+            for (var i = 0; i < _wave.Length; i++)
+            {
+                var t = Time.unscaledTime * 3.2f + i * 0.45f;
+                var a = aligning ? (0.20f + 0.80f * Mathf.Abs(Mathf.Sin(t))) : 0.16f;
+                var rt = _wave[i].rectTransform;
+                rt.sizeDelta = new Vector2(WaveBarW, WaveH * a);
+            }
+        }
+
         /// <summary>What to say when the host sends a state but no reason. The
         /// host owns the wording whenever it has something to say; this only
-        /// covers the silence, and it says what the operator should do rather
-        /// than restating the state name already in the pill.</summary>
+        /// covers the silence.</summary>
         private static string DefaultMessage(string state)
         {
             switch (state)
@@ -325,7 +368,7 @@ namespace WeGo.Teleop
             BuildShell(root);
             BuildHeader(root);
             BuildLeftColumn(root);
-            BuildCentreColumn(root);
+            BuildStageColumn(root);
             BuildRightColumn(root);
         }
 
@@ -336,24 +379,17 @@ namespace WeGo.Teleop
             Sprite9(root, TeleopHudTextures.RoundedRect(26, 2f), BorderSoft,
                     Anchor05, Vector2.zero, new Vector2(W, H));
 
-            // Scanlines. Tiled, so the period is in panel units and does not
-            // change with the console's size.
             var scan = Sprite9(root, TeleopHudTextures.Scanline(0.035f), GreenLo,
                                Anchor05, Vector2.zero, new Vector2(W - 8f, H - 8f));
             scan.type = Image.Type.Tiled;
 
-            // Corner brackets: the mock's strongest single cue that this is an
-            // instrument and not a notification.
-            //
-            // Place() sets pivot == anchor, so anchoring each bracket to its
-            // own corner makes the same two positive-size rectangles mirror
-            // into all four without any sign juggling.
+            // Corner brackets. Place() sets pivot == anchor, so anchoring each
+            // bracket to its own corner mirrors the same two positive-size
+            // rectangles into all four without sign juggling.
             const float bs = 46f, bt = 4f, bi = 18f;
             foreach (var corner in Corners)
             {
-                var ox = corner.x < 0.5f ? bi : -bi;
-                var oy = corner.y > 0.5f ? -bi : bi;
-                var o = new Vector2(ox, oy);
+                var o = new Vector2(corner.x < 0.5f ? bi : -bi, corner.y > 0.5f ? -bi : bi);
                 Solid(root, Green, corner, o, new Vector2(bs, bt));
                 Solid(root, Green, corner, o, new Vector2(bt, bs));
             }
@@ -361,28 +397,33 @@ namespace WeGo.Teleop
 
         private void BuildHeader(RectTransform root)
         {
-            _facing = Label(root, 32, FontStyle.Normal, GreenHi, TextAnchor.UpperCenter,
+            _facing = Label(root, 30, FontStyle.Normal, GreenHi, TextAnchor.UpperCenter,
                             new Vector2(0f, -24f), new Vector2(W, 40f));
+
+            // The mock's RECENTER button, as a prompt: there is no pointer in
+            // this app, so it names the control instead of pretending to be one.
+            Label(root, 24, FontStyle.Normal, Dim, TextAnchor.UpperRight,
+                  new Vector2(-Pad - 40f, -26f), new Vector2(360f, 34f))
+                .text = "RECENTER — hold ☰";
+
             _posture = Label(root, 38, FontStyle.Bold, White, TextAnchor.UpperCenter,
-                             new Vector2(0f, -68f), new Vector2(W, 46f));
+                             new Vector2(0f, -70f), new Vector2(W, 46f));
         }
 
         // ------------------------------------------------------------------
         private void BuildLeftColumn(RectTransform root)
         {
-            var gauge = Panel(root, new Vector2(Pad + 4f, ColTop), new Vector2(SideW, 380f),
-                              "ALIGNMENT");
+            var gauge = Panel(root, new Vector2(Pad, ColTop), new Vector2(SideW, 360f),
+                              "Overall Alignment");
 
             const float ring = 196f;
-            var centre = new Vector2(SideW * 0.5f, -196f);
+            var centre = new Vector2(SideW * 0.5f - ring * 0.5f, -70f);
 
             Sprite9(gauge, TeleopHudTextures.Ring(192, 0.16f), Track,
-                    AnchorTopLeft, centre - new Vector2(ring * 0.5f, -ring * 0.5f),
-                    new Vector2(ring, ring));
+                    AnchorTopLeft, centre, new Vector2(ring, ring));
 
             _gaugeFill = Sprite9(gauge, TeleopHudTextures.Ring(192, 0.16f), Amber,
-                                 AnchorTopLeft, centre - new Vector2(ring * 0.5f, -ring * 0.5f),
-                                 new Vector2(ring, ring));
+                                 AnchorTopLeft, centre, new Vector2(ring, ring));
             // Radial fill from the top, clockwise -- the direction a gauge is
             // read, and the direction the mock's SVG stroke ran.
             _gaugeFill.type = Image.Type.Filled;
@@ -391,152 +432,77 @@ namespace WeGo.Teleop
             _gaugeFill.fillClockwise = true;
             _gaugeFill.fillAmount = 0f;
 
-            _gaugePct = Label(gauge, 64, FontStyle.Bold, White, TextAnchor.MiddleCenter,
-                              new Vector2(SideW * 0.5f - 90f, -158f), new Vector2(180f, 76f));
-            _gaugeTier = Label(gauge, 26, FontStyle.Bold, Amber, TextAnchor.MiddleCenter,
-                               new Vector2(SideW * 0.5f - 90f, -232f), new Vector2(180f, 32f));
-            _gaugeMsg = Label(gauge, 26, FontStyle.Normal, Green, TextAnchor.UpperCenter,
-                              new Vector2(20f, -294f), new Vector2(SideW - 40f, 76f));
+            _gaugePct = Label(gauge, 62, FontStyle.Bold, White, TextAnchor.MiddleCenter,
+                              new Vector2(SideW * 0.5f - 90f, -128f), new Vector2(180f, 74f));
+            _gaugeTier = Label(gauge, 24, FontStyle.Bold, Amber, TextAnchor.MiddleCenter,
+                               new Vector2(SideW * 0.5f - 90f, -198f), new Vector2(180f, 30f));
+            _gaugeMsg = Label(gauge, 25, FontStyle.Normal, Green, TextAnchor.UpperCenter,
+                              new Vector2(18f, -272f), new Vector2(SideW - 36f, 76f));
 
-            // Reference figure: the simulator's own front-on render of the G1,
-            // keyed to transparency by tools/make_reference_figure.py. It is
-            // here to answer "what am I matching?" without words, which is the
-            // one question the old text panel could not answer at all.
-            var reference = Panel(root, new Vector2(Pad + 4f, ColTop - 392f),
-                                  new Vector2(SideW, 242f), "REFERENCE");
+            BuildChecklist(root, ColTop - 360f - Gap);
+
+            // Tip. The figure is deliberately large: at the previous 120 units
+            // the G1 was a smudge, and a reference image nobody can make out is
+            // just a dark rectangle taking up a panel.
+            var tipTop = ColTop - 360f - Gap - 420f - Gap;
+            var tip = Panel(root, new Vector2(Pad, tipTop), new Vector2(SideW, 272f), "Tip");
+
             var figure = Resources.Load<Texture2D>("g1_reference");
+            var textX = 24f;
             if (figure != null)
             {
-                const float figH = 168f;
+                const float figH = 210f;
                 var w = figH * figure.width / figure.height;
                 var img = new GameObject("Figure", typeof(RawImage));
                 var raw = img.GetComponent<RawImage>();
                 raw.texture = figure;
-                // Tinted above white. The render is mid-grey on a panel that is
-                // nearly black, and at 1:1 the robot reads as a smudge; the
-                // mock compensated with a CSS brightness filter and this is the
-                // same move. The faint green bias ties it to the console rather
-                // than leaving a grey cut-out floating on it.
+                // Tinted above white: the render is mid-grey on a near-black
+                // panel and reads as a smudge at 1:1. The mock used a CSS
+                // brightness filter for the same reason.
                 raw.color = new Color(1.55f, 1.70f, 1.60f, 1f);
                 raw.raycastTarget = false;
-                Place(img, reference, AnchorTopLeft,
-                      new Vector2(24f, -62f), new Vector2(w, figH));
-            }
-            else
-            {
-                Debug.LogWarning("[Teleop] no Resources/g1_reference; the console " +
-                                 "will show the reference panel without a figure. " +
-                                 "Run tools/make_reference_figure.py.");
+                Place(img, tip, AnchorTopLeft, new Vector2(18f, -52f), new Vector2(w, figH));
+                textX = 18f + w + 16f;
             }
 
-            Label(reference, 26, FontStyle.Normal, Dim, TextAnchor.UpperLeft,
-                  new Vector2(174f, -62f), new Vector2(SideW - 198f, 180f))
-                .text = "Stand as the robot stands. You are matching its posture, " +
-                        "not its height.";
+            Label(tip, 24, FontStyle.Normal, Dim, TextAnchor.UpperLeft,
+                  new Vector2(textX, -52f), new Vector2(SideW - textX - 18f, 210f))
+                .text = "Copy the pose, don't chase the numbers. Relaxed stance, " +
+                        "elbows bent, hands at belly height — the 10 cm tolerance " +
+                        "does the rest.";
         }
 
-        // ------------------------------------------------------------------
-        private void BuildCentreColumn(RectTransform root)
-        {
-            var bar = Panel(root, new Vector2(CentreX, ColTop),
-                            new Vector2(CentreW, 250f), null);
-
-            // State pill and message share a row, split by a rule -- the mock's
-            // row1. The pill is the one thing on the console readable from the
-            // very corner of the eye.
-            // Wide enough for "ESTOP REQUESTED", the longest state the host can
-            // send. The pill also best-fits its text (see Label below), but
-            // sizing the box for the worst case keeps the short states from
-            // being rendered at a different size to the long ones.
-            const float pillW = 360f, rowH = 104f;
-            _pillBorder = Sprite9(bar, TeleopHudTextures.RoundedRect(14, 2f), Border,
-                                  AnchorTopLeft, new Vector2(18f, -16f),
-                                  new Vector2(pillW, rowH - 12f));
-            _pill = Label(bar, 46, FontStyle.Bold, Green, TextAnchor.MiddleCenter,
-                          new Vector2(18f, -16f), new Vector2(pillW, rowH - 12f));
-            // Shrink-to-fit rather than wrap. A wrapped state name splits
-            // "FOLLOWING" across two lines inside the pill, which is the one
-            // element on the console that has to be readable at a glance.
-            _pill.horizontalOverflow = HorizontalWrapMode.Overflow;
-            _pill.resizeTextForBestFit = true;
-            _pill.resizeTextMinSize = 24;
-            _pill.resizeTextMaxSize = 46;
-
-            _message = Label(bar, 33, FontStyle.Normal, White, TextAnchor.MiddleLeft,
-                             new Vector2(pillW + 40f, -16f),
-                             new Vector2(CentreW - pillW - 60f, rowH - 12f));
-
-            Solid(bar, BorderSoft, AnchorTopLeft, new Vector2(18f, -rowH - 8f),
-                  new Vector2(CentreW - 36f, 2f));
-
-            _barTrack = Sprite9(bar, TeleopHudTextures.RoundedRect(11), Track,
-                                AnchorTopLeft, new Vector2(Pad, -rowH - 34f),
-                                new Vector2(CentreW - 2f * Pad, 22f));
-            _barFill = Sprite9(_barTrack.rectTransform, TeleopHudTextures.RoundedRect(11), Amber,
-                               AnchorTopLeft, Vector2.zero,
-                               new Vector2(CentreW - 2f * Pad, 22f));
-            _barFillRect = _barFill.rectTransform;
-
-            _sub = Label(bar, 26, FontStyle.Normal, Dim, TextAnchor.UpperCenter,
-                         new Vector2(Pad, -rowH - 78f),
-                         new Vector2(CentreW - 2f * Pad, 40f));
-
-            // Status block. The e-stop reminder is the only red thing on a
-            // healthy console, so it never has to compete for attention.
-            var status = Panel(root, new Vector2(CentreX, ColTop - 268f),
-                               new Vector2(CentreW, 366f), "SESSION");
-
-            Sprite9(status, TeleopHudTextures.Disc(48), Red, AnchorTopLeft,
-                    new Vector2(28f, -66f), new Vector2(38f, 38f));
-            Label(status, 33, FontStyle.Bold, Red, TextAnchor.MiddleLeft,
-                  new Vector2(82f, -66f), new Vector2(CentreW - 106f, 38f))
-                .text = Session != null ? Session.EstopHint : "Y + B  =  EMERGENCY STOP";
-
-            Label(status, 26, FontStyle.Normal, Dim, TextAnchor.UpperLeft,
-                  new Vector2(28f, -122f), new Vector2(CentreW - 56f, 40f))
-                .text = "Hold both for two seconds. The robot damps to a stop.";
-
-            Solid(status, BorderSoft, AnchorTopLeft, new Vector2(28f, -178f),
-                  new Vector2(CentreW - 56f, 2f));
-
-            _link = Label(status, 26, FontStyle.Normal, Dim, TextAnchor.UpperLeft,
-                          new Vector2(28f, -200f), new Vector2(CentreW - 56f, 40f));
-            _reason = Label(status, 24, FontStyle.Normal, GreenLo, TextAnchor.UpperLeft,
-                            new Vector2(28f, -250f), new Vector2(CentreW - 56f, 110f));
-        }
-
-        // ------------------------------------------------------------------
         private static readonly string[] CheckNames =
         {
-            "Link to host",
-            "Head tracked",
-            "Robot pose received",
-            "Left hand on target",
-            "Right hand on target",
-            "Both hands in tolerance",
-            "Alignment complete",
+            "Head Tracked",
+            "Left Target In View",
+            "Right Target In View",
+            "Left Hand On Target",
+            "Right Hand On Target",
+            "Both Hands Held",
+            "Position Check",
         };
 
-        private void BuildRightColumn(RectTransform root)
+        private void BuildChecklist(RectTransform root, float top)
         {
-            var panel = Panel(root, new Vector2(RightX, ColTop),
-                              new Vector2(SideW, 634f), "READINESS");
+            var panel = Panel(root, new Vector2(Pad, top), new Vector2(SideW, 420f),
+                              "Alignment Checklist");
 
             _checks = new Check[CheckNames.Length];
             for (var i = 0; i < CheckNames.Length; i++)
             {
-                var y = -66f - i * 78f;
+                var y = -60f - i * 50f;
                 var marker = Sprite9(panel, TeleopHudTextures.Disc(40),
                                      new Color(0.471f, 0.784f, 0.647f, 0.30f),
-                                     AnchorTopLeft, new Vector2(20f, y),
-                                     new Vector2(38f, 38f));
-                var tick = Label(panel, 28, FontStyle.Bold, Color.clear,
-                                 TextAnchor.MiddleCenter, new Vector2(20f, y),
-                                 new Vector2(38f, 38f));
+                                     AnchorTopLeft, new Vector2(18f, y),
+                                     new Vector2(34f, 34f));
+                var tick = Label(panel, 25, FontStyle.Bold, Color.clear,
+                                 TextAnchor.MiddleCenter, new Vector2(18f, y),
+                                 new Vector2(34f, 34f));
                 tick.text = "✓";
 
-                var label = Label(panel, 28, FontStyle.Normal, Dim, TextAnchor.MiddleLeft,
-                                  new Vector2(74f, y), new Vector2(SideW - 94f, 38f));
+                var label = Label(panel, 24, FontStyle.Normal, Dim, TextAnchor.MiddleLeft,
+                                  new Vector2(66f, y), new Vector2(SideW - 86f, 34f));
                 label.text = CheckNames[i];
 
                 _checks[i] = new Check { Label = label, Marker = marker, Tick = tick };
@@ -544,10 +510,191 @@ namespace WeGo.Teleop
         }
 
         // ------------------------------------------------------------------
+        private const float StageH = 780f;
+        private const float HoldW = 300f, HoldH = 54f;
+
+        private void BuildStageColumn(RectTransform root)
+        {
+            // The stage itself. Bordered like a panel but with no header, so
+            // the image is the whole of it -- which is what it has to be when
+            // the camera stream takes it over.
+            var frame = Sprite9(root, TeleopHudTextures.RoundedRect(14), new Color(0f, 0f, 0f, 0.85f),
+                                AnchorTopLeft, new Vector2(StageX, ColTop),
+                                new Vector2(StageW, StageH)).rectTransform;
+            Sprite9(frame, TeleopHudTextures.RoundedRect(14, 2f), Border,
+                    Anchor05, Vector2.zero, new Vector2(StageW, StageH));
+
+            var imgGo = new GameObject("StageImage", typeof(RawImage));
+            _stageImage = imgGo.GetComponent<RawImage>();
+            _stageImage.texture = Stage != null ? Stage.Output : Texture2D.blackTexture;
+            _stageImage.raycastTarget = false;
+            Place(imgGo, frame, AnchorTopLeft, new Vector2(4f, -4f),
+                  new Vector2(StageW - 8f, StageH - 8f));
+
+            // REFERENCE badge, bottom-right of the stage, as in the mock.
+            var badge = Resources.Load<Texture2D>("g1_reference");
+            if (badge != null)
+            {
+                const float bh = 190f;
+                var bw = bh * badge.width / badge.height;
+                var caption = Label(frame, 22, FontStyle.Bold, Green, TextAnchor.UpperCenter,
+                                    new Vector2(StageW - 250f, -StageH + bh + 58f),
+                                    new Vector2(230f, 30f));
+                caption.horizontalOverflow = HorizontalWrapMode.Overflow;
+                caption.text = "REFERENCE";
+
+                var go = new GameObject("RefBadge", typeof(RawImage));
+                var raw = go.GetComponent<RawImage>();
+                raw.texture = badge;
+                raw.color = new Color(1.55f, 1.70f, 1.60f, 1f);
+                raw.raycastTarget = false;
+                Place(go, frame, AnchorTopLeft,
+                      new Vector2(StageW - bw - 30f, -StageH + bh + 24f),
+                      new Vector2(bw, bh));
+            }
+
+            Label(frame, 20, FontStyle.Normal, new Color(0.59f, 0.84f, 0.71f, 0.34f),
+                  TextAnchor.LowerLeft, new Vector2(14f, -StageH + 30f),
+                  new Vector2(520f, 26f)).text = "reference pose · rings are your wrist targets";
+
+            BuildAlignBar(root, ColTop - StageH - Gap);
+        }
+
+        private void BuildAlignBar(RectTransform root, float top)
+        {
+            const float barH = 150f, rowH = 96f, pillW = 300f;
+
+            var bar = Sprite9(root, TeleopHudTextures.RoundedRect(12), new Color(0.024f, 0.063f, 0.043f, 0.72f),
+                              AnchorTopLeft, new Vector2(StageX, top),
+                              new Vector2(StageW, barH)).rectTransform;
+            Sprite9(bar, TeleopHudTextures.RoundedRect(12, 2f), Border,
+                    Anchor05, Vector2.zero, new Vector2(StageW, barH));
+
+            _pillBorder = Sprite9(bar, TeleopHudTextures.RoundedRect(10, 2f), Border,
+                                  AnchorTopLeft, new Vector2(14f, -12f),
+                                  new Vector2(pillW, rowH - 12f));
+            _pill = Label(bar, 42, FontStyle.Bold, Green, TextAnchor.MiddleCenter,
+                          new Vector2(14f, -12f), new Vector2(pillW, rowH - 12f));
+            // Shrink-to-fit rather than wrap: a wrapped state name splits
+            // "FOLLOWING" across two lines inside the pill, and the pill is the
+            // one element that has to be readable at a glance.
+            _pill.horizontalOverflow = HorizontalWrapMode.Overflow;
+            _pill.resizeTextForBestFit = true;
+            _pill.resizeTextMinSize = 22;
+            _pill.resizeTextMaxSize = 42;
+
+            _message = Label(bar, 30, FontStyle.Normal, White, TextAnchor.MiddleLeft,
+                             new Vector2(pillW + 36f, -12f),
+                             new Vector2(StageW - pillW - 56f, rowH - 12f));
+
+            Solid(bar, BorderSoft, AnchorTopLeft, new Vector2(0f, -rowH),
+                  new Vector2(StageW, 2f));
+
+            _sub = Label(bar, 24, FontStyle.Normal, Dim, TextAnchor.UpperCenter,
+                         new Vector2(20f, -rowH - 14f), new Vector2(StageW - 40f, 36f));
+
+            // Hold prompts.
+            var holdsTop = top - barH - 12f;
+            _confirmFill = BuildHold(root, new Vector2(StageX, holdsTop),
+                                     "HOLD CONFIRM  (grips)", out _confirmLabel,
+                                     out _confirmFillRect);
+            _skipFill = BuildHold(root, new Vector2(StageX + HoldW + 16f, holdsTop),
+                                  "HOLD SKIP  (A / X)", out _skipLabel, out _skipFillRect);
+
+            _reason = Label(root, 22, FontStyle.Normal, GreenLo, TextAnchor.MiddleLeft,
+                            new Vector2(StageX + 2f * HoldW + 44f, holdsTop),
+                            new Vector2(StageW - 2f * HoldW - 46f, HoldH));
+
+            _link = Label(root, 22, FontStyle.Normal, Dim, TextAnchor.UpperLeft,
+                          new Vector2(StageX, holdsTop - HoldH - 12f),
+                          new Vector2(StageW, 32f));
+        }
+
+        private Image BuildHold(RectTransform root, Vector2 pos, string label,
+                                out Text text, out RectTransform fillRect)
+        {
+            var box = Sprite9(root, TeleopHudTextures.RoundedRect(10), new Color(0.027f, 0.071f, 0.047f, 0.80f),
+                              AnchorTopLeft, pos, new Vector2(HoldW, HoldH)).rectTransform;
+            var fill = Sprite9(box, TeleopHudTextures.RoundedRect(10), Amber,
+                               AnchorTopLeft, Vector2.zero, new Vector2(0f, HoldH));
+            fill.color = new Color(1f, 0.79f, 0.25f, 0.28f);
+            Sprite9(box, TeleopHudTextures.RoundedRect(10, 2f), Border,
+                    Anchor05, Vector2.zero, new Vector2(HoldW, HoldH));
+            text = Label(box, 23, FontStyle.Bold, GreenHi, TextAnchor.MiddleCenter,
+                         Vector2.zero, new Vector2(HoldW, HoldH));
+            text.text = label;
+            fillRect = fill.rectTransform;
+            return fill;
+        }
+
+        // ------------------------------------------------------------------
+        private const float WaveH = 46f, WaveBarW = 5f;
+
+        private void BuildRightColumn(RectTransform root)
+        {
+            var joint = Panel(root, new Vector2(RightX, ColTop),
+                              new Vector2(SideW, 220f), "Joint Guide");
+            var legend = new[]
+            {
+                ("Good", Green), ("Adjust", Amber), ("Poor", Red),
+            };
+            for (var i = 0; i < legend.Length; i++)
+            {
+                var y = -64f - i * 48f;
+                Sprite9(joint, TeleopHudTextures.Disc(32), legend[i].Item2,
+                        AnchorTopLeft, new Vector2(20f, y), new Vector2(28f, 28f));
+                Label(joint, 25, FontStyle.Normal, White, TextAnchor.MiddleLeft,
+                      new Vector2(62f, y), new Vector2(SideW - 82f, 28f))
+                    .text = legend[i].Item1;
+            }
+
+            var voiceTop = ColTop - 220f - Gap;
+            var voice = Panel(root, new Vector2(RightX, voiceTop),
+                              new Vector2(SideW, 260f), "Voice Guide");
+            _voice = Label(voice, 25, FontStyle.Normal, White, TextAnchor.UpperLeft,
+                           new Vector2(20f, -58f), new Vector2(SideW - 40f, 120f));
+
+            _wave = new Image[22];
+            for (var i = 0; i < _wave.Length; i++)
+            {
+                _wave[i] = Sprite9(voice, TeleopHudTextures.RoundedRect(3), Green,
+                                   new Vector2(0f, 0f), new Vector2(22f + i * 9f, 26f),
+                                   new Vector2(WaveBarW, WaveH * 0.4f));
+            }
+
+            var estopTop = voiceTop - 260f - Gap;
+            var estop = Panel(root, new Vector2(RightX, estopTop),
+                              new Vector2(SideW, 572f), null);
+
+            Label(estop, 30, FontStyle.Bold, Red, TextAnchor.UpperCenter,
+                  new Vector2(20f, -34f), new Vector2(SideW - 40f, 38f))
+                .text = Session != null ? "Y+B = E-STOP" : "Y+B = E-STOP";
+
+            // The button is a prompt, like the holds -- but drawn as the real
+            // thing, because an e-stop that looks like a label is a safety
+            // problem. Two discs make the dome read as a dome.
+            const float dome = 190f;
+            var cx = (SideW - dome) * 0.5f;
+            Sprite9(estop, TeleopHudTextures.Disc(200), new Color(0.56f, 0.08f, 0.07f),
+                    AnchorTopLeft, new Vector2(cx, -110f), new Vector2(dome, dome));
+            Sprite9(estop, TeleopHudTextures.Disc(200), new Color(0.94f, 0.25f, 0.24f),
+                    AnchorTopLeft, new Vector2(cx + 16f, -122f),
+                    new Vector2(dome - 42f, dome - 42f));
+            Sprite9(estop, TeleopHudTextures.Disc(200), new Color(1f, 0.62f, 0.60f, 0.55f),
+                    AnchorTopLeft, new Vector2(cx + 44f, -140f),
+                    new Vector2(dome * 0.36f, dome * 0.36f));
+
+            Label(estop, 30, FontStyle.Bold, Green, TextAnchor.UpperCenter,
+                  new Vector2(20f, -324f), new Vector2(SideW - 40f, 38f))
+                .text = "EMERGENCY STOP";
+            Label(estop, 22, FontStyle.Normal, Dim, TextAnchor.UpperCenter,
+                  new Vector2(20f, -368f), new Vector2(SideW - 40f, 90f))
+                .text = "Hold both face buttons for two seconds. The robot damps to a stop.";
+        }
+
+        // ------------------------------------------------------------------
         // widgets
         // ------------------------------------------------------------------
-        /// <summary>A bordered card with an optional uppercase section header.
-        /// Returns the card's rect, which children anchor inside.</summary>
         private RectTransform Panel(RectTransform parent, Vector2 position,
                                     Vector2 size, string header)
         {
@@ -557,20 +704,23 @@ namespace WeGo.Teleop
                     Anchor05, Vector2.zero, size);
 
             if (!string.IsNullOrEmpty(header))
-                Label(card, 25, FontStyle.Bold, Green, TextAnchor.UpperLeft,
-                      new Vector2(20f, -16f), new Vector2(size.x - 40f, 32f))
+                Label(card, 23, FontStyle.Bold, Green, TextAnchor.UpperLeft,
+                      new Vector2(20f, -16f), new Vector2(size.x - 40f, 30f))
                     .text = Spaced(header);
 
             return card;
         }
 
-        /// <summary>Legacy Text has no letter-spacing, and the mock's section
-        /// headers lean on it heavily. Interleaving thin spaces is the only way
-        /// to get it without pulling in TextMeshPro for six labels.</summary>
+        /// <summary>Legacy Text has no letter-spacing and the mock's section
+        /// headers lean on it. Interleaving spaces is the only way to get it
+        /// without pulling in TextMeshPro for six labels -- but it roughly
+        /// doubles the width, and "Alignment Checklist" spaced out wraps onto
+        /// two lines in a 400-unit panel. Long headers therefore get the
+        /// uppercase without the spacing.</summary>
         private static string Spaced(string s)
         {
-            var chars = s.ToUpperInvariant().ToCharArray();
-            return string.Join(" ", chars);
+            var upper = s.ToUpperInvariant();
+            return upper.Length > 12 ? upper : string.Join(" ", upper.ToCharArray());
         }
 
         private static readonly Vector2 Anchor05 = new Vector2(0.5f, 0.5f);
@@ -595,9 +745,6 @@ namespace WeGo.Teleop
             return image;
         }
 
-        /// <summary>A plain filled rectangle: rules, dividers, brackets.
-        /// Anchored by <paramref name="anchor"/>, which for the corner
-        /// brackets is the corner itself, so the same offsets mirror.</summary>
         private Image Solid(RectTransform parent, Color colour, Vector2 anchor,
                             Vector2 position, Vector2 size)
         {
@@ -627,8 +774,9 @@ namespace WeGo.Teleop
             return text;
         }
 
-        /// <summary>Anchored top-left: position is an offset from the parent's
-        /// top-left corner, so y values are negative going down.</summary>
+        /// <summary>Anchored top-left by default: position is an offset from
+        /// the parent's top-left corner, so y values are negative going
+        /// down.</summary>
         private static void Place(GameObject go, RectTransform parent,
                                   Vector2 anchor, Vector2 position, Vector2 size)
         {

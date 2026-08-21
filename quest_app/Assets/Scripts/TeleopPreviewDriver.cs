@@ -46,8 +46,15 @@ namespace WeGo.Teleop
         // ITeleopPoses
         // ------------------------------------------------------------------
         Vector3 ITeleopPoses.Head => _headPos;
+        Quaternion ITeleopPoses.HeadRotation => Quaternion.Euler(_pitch, _yaw, 0f);
         Vector3 ITeleopPoses.LeftWrist => _leftWrist;
         Vector3 ITeleopPoses.RightWrist => _rightWrist;
+
+        // Controllers are held roughly level and pointing where the operator
+        // faces. The preview has no way to know a real wrist's roll, and
+        // pretending otherwise would make the marker's roll stub a lie.
+        Quaternion ITeleopPoses.LeftWristRotation => Quaternion.Euler(_pitch * 0.5f, _yaw, 0f);
+        Quaternion ITeleopPoses.RightWristRotation => Quaternion.Euler(_pitch * 0.5f, _yaw, 0f);
 
         private Vector3 _headPos = new Vector3(0f, 1.62f, 0f);
         private Vector3 _leftWrist, _rightWrist;
@@ -122,8 +129,12 @@ namespace WeGo.Teleop
                 // A slow look around, so the console's follow behaviour and the
                 // guide's edge chevrons are both visible without touching
                 // anything.
-                _yaw = Mathf.Sin(_demoT * 0.55f) * 16f;
-                _pitch = 8f + Mathf.Sin(_demoT * 0.4f) * 6f;
+                // Enough downward pitch to bring the operator's own hands into
+                // view, since that is where the rings and the controller
+                // markers are and a preview that never shows them is not
+                // previewing the thing that matters.
+                _yaw = Mathf.Sin(_demoT * 0.55f) * 14f;
+                _pitch = 20f + Mathf.Sin(_demoT * 0.4f) * 10f;
                 return;
             }
 
@@ -223,6 +234,11 @@ namespace WeGo.Teleop
 
             var confirming = _manual ? Input.GetKey(KeyCode.Space) : _demoConfirming;
             var skip = _manual && Input.GetKey(KeyCode.Tab);
+
+            // The device reads these off the grips and A/X in PollButtons;
+            // offline that path never runs, so the driver supplies them.
+            Session.ConfirmHeld = confirming;
+            Session.SkipLatched = _skipLatched;
             if (skip && !_skipLatched) _skipLatched = true;
 
             var gate = confirming && (within || _skipLatched);

@@ -55,13 +55,22 @@ namespace WeGo.Teleop
             driver.Session = session;
             driver.Head = cam;
 
+            var stage = host.AddComponent<TeleopStage>();
+            stage.Session = session;
+
             var hud = host.AddComponent<TeleopHud>();
             hud.Session = session;
+            hud.Stage = stage;
             hud.Anchor = cam.transform;
+
+            cam.cullingMask &= ~(1 << TeleopStage.StageLayer);
 
             var guide = host.AddComponent<TeleopAlignGuide>();
             guide.Session = session;
             guide.HeadAnchor = cam.transform;
+
+            var posture = host.AddComponent<TeleopPostureGuide>();
+            posture.Session = session;
 
             host.SetActive(true);
 

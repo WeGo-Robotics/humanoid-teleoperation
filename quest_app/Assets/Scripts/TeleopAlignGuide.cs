@@ -52,7 +52,6 @@ namespace WeGo.Teleop
         private LineRenderer _leftRing, _rightRing, _leftLead, _rightLead;
         private LineRenderer _leftArrow, _rightArrow;
         private Material _material;
-        private Camera _head;
 
         private void Start()
         {
@@ -110,23 +109,22 @@ namespace WeGo.Teleop
                 return;
             }
 
-            if (_head == null) _head = ResolveHead();
-
             DrawSide(Session.LeftAlignTarget, Session.LeftWristPosition, Session.LeftPosError,
                      _leftRing, _leftLead, _leftArrow);
             DrawSide(Session.RightAlignTarget, Session.RightWristPosition, Session.RightPosError,
                      _rightRing, _rightLead, _rightArrow);
         }
 
-        private Camera ResolveHead()
-        {
-            if (HeadAnchor != null)
-            {
-                var c = HeadAnchor.GetComponent<Camera>();
-                if (c != null) return c;
-            }
-            return Camera.main;
-        }
+        /// <summary>Head pose from the session, for the same reason TeleopHud
+        /// takes it from there: OVRCameraRig's anchors do not move on this
+        /// headset, so anything derived from the camera transform -- ring
+        /// facing, the in-view test, the edge chevrons -- was being computed
+        /// against identity.</summary>
+        private Vector3 HeadPos => Session != null ? Session.HeadPosition
+                                 : (HeadAnchor != null ? HeadAnchor.position : Vector3.zero);
+
+        private Quaternion HeadRot => Session != null ? Session.HeadRotation
+                                    : (HeadAnchor != null ? HeadAnchor.rotation : Quaternion.identity);
 
         private void DrawSide(Vector3 target, Vector3 wrist, float hostErr,
                               LineRenderer ring, LineRenderer lead, LineRenderer arrow)
@@ -176,8 +174,7 @@ namespace WeGo.Teleop
         /// a hand through rather than an ellipse that happens to be edge-on.</summary>
         private void DrawRing(LineRenderer lr, Vector3 centre, Color colour)
         {
-            var normal = _head != null ? (centre - _head.transform.position).normalized
-                                       : Vector3.forward;
+            var normal = (centre - HeadPos).normalized;
             if (normal.sqrMagnitude < 1e-6f) normal = Vector3.forward;
             var up = Mathf.Abs(Vector3.Dot(normal, Vector3.up)) > 0.95f ? Vector3.forward : Vector3.up;
             var a = Vector3.Normalize(Vector3.Cross(up, normal)) * RingRadius;
@@ -198,9 +195,12 @@ namespace WeGo.Teleop
         /// to say where it went.</summary>
         private void DrawEdgeArrow(LineRenderer lr, Vector3 target)
         {
-            if (_head == null) { lr.enabled = false; return; }
-            var cam = _head.transform;
-            var local = cam.InverseTransformPoint(target);
+            var headPos = HeadPos;
+            var headRot = HeadRot;
+            var fwd = headRot * Vector3.forward;
+            var right = headRot * Vector3.right;
+            var up = headRot * Vector3.up;
+            var local = Quaternion.Inverse(headRot) * (target - headPos);
 
             // Behind the operator, the projected point mirrors; flipping keeps
             // the chevron pointing the short way round instead of the long way.
@@ -215,10 +215,10 @@ namespace WeGo.Teleop
             // of it -- two red arrows over the readouts they were supposed to
             // be sending the operator to.
             const float dist = 1.0f, extent = 0.62f, size = 0.05f;
-            var centre = cam.position + cam.forward * dist
-                       + cam.right * dir.x * extent + cam.up * dir.y * extent;
-            var tip = cam.right * dir.x + cam.up * dir.y;
-            var side = Vector3.Cross(tip, cam.forward).normalized;
+            var centre = headPos + fwd * dist
+                       + right * dir.x * extent + up * dir.y * extent;
+            var tip = right * dir.x + up * dir.y;
+            var side = Vector3.Cross(tip, fwd).normalized;
 
             lr.positionCount = 4;
             lr.SetPosition(0, centre + tip * size);
@@ -228,11 +228,20 @@ namespace WeGo.Teleop
             Tint(lr, Bad, 1f);
         }
 
+        /// <summary>Angle-based rather than WorldToViewportPoint, because the
+        /// camera's transform does not track on this headset and the viewport
+        /// test was therefore being run against a camera sitting at the origin
+        /// facing +Z. Half-angles are a Quest 3's usable field of view with a
+        /// margin, so a target near the edge switches to a chevron slightly
+        /// before it actually leaves view.</summary>
+        private const float HalfFovH = 44f, HalfFovV = 38f;
+
         private bool IsInView(Vector3 world)
         {
-            if (_head == null) return true;
-            var v = _head.WorldToViewportPoint(world);
-            return v.z > 0f && v.x > 0.04f && v.x < 0.96f && v.y > 0.04f && v.y < 0.96f;
+            var local = Quaternion.Inverse(HeadRot) * (world - HeadPos);
+            if (local.z <= 0.01f) return false;
+            return Mathf.Abs(Mathf.Atan2(local.x, local.z) * Mathf.Rad2Deg) < HalfFovH
+                && Mathf.Abs(Mathf.Atan2(local.y, local.z) * Mathf.Rad2Deg) < HalfFovV;
         }
 
         private static void Tint(LineRenderer lr, Color c, float alpha)

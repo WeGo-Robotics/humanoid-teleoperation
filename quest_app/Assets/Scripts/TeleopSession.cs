@@ -56,6 +56,14 @@ namespace WeGo.Teleop
         public Vector3 RightAlignTarget => HeadPosition + _rightTargetOffset;
         public bool HasAlignTargets;
         public bool AlignWithinTolerance;
+
+        /// <summary>Both grips held, and A/X pressed at least once this
+        /// alignment. Read locally rather than echoed back from the host: the
+        /// checklist has to respond the instant the operator squeezes, and a
+        /// round trip through the host would make it lag by a message. Nothing
+        /// gates on these -- the host still decides.</summary>
+        public bool ConfirmHeld;
+        public bool SkipLatched;
         public float LeftPosError = float.PositiveInfinity;
         public float RightPosError = float.PositiveInfinity;
 
@@ -65,10 +73,28 @@ namespace WeGo.Teleop
         public Vector3 HeadPosition => Poses != null ? Poses.Head
             : InputTracking.GetLocalPosition(XRNode.CenterEye);
 
+        /// <summary>Read through InputTracking rather than off
+        /// OVRCameraRig.centerEyeAnchor.
+        ///
+        /// The rig's anchors are driven by OVRPlugin, which on this headset
+        /// reports empty for the controller state and, measured on device,
+        /// leaves centerEyeAnchor at identity. Anything that hung its
+        /// orientation off that transform -- the console's follow behaviour and
+        /// its facing/pitch readout -- simply never moved. InputTracking is a
+        /// separate pipe through the XR input subsystem and is the one that
+        /// works here; see docs section 14.</summary>
+        public Quaternion HeadRotation => Poses != null ? Poses.HeadRotation
+            : InputTracking.GetLocalRotation(XRNode.CenterEye);
+
         public Vector3 LeftWristPosition => Poses != null ? Poses.LeftWrist
-            : OVRInput.GetLocalControllerPosition(OVRInput.Controller.LTouch);
+            : InputTracking.GetLocalPosition(XRNode.LeftHand);
         public Vector3 RightWristPosition => Poses != null ? Poses.RightWrist
-            : OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
+            : InputTracking.GetLocalPosition(XRNode.RightHand);
+
+        public Quaternion LeftWristRotation => Poses != null ? Poses.LeftWristRotation
+            : InputTracking.GetLocalRotation(XRNode.LeftHand);
+        public Quaternion RightWristRotation => Poses != null ? Poses.RightWristRotation
+            : InputTracking.GetLocalRotation(XRNode.RightHand);
 
         /// <summary>Non-null only in the desktop preview build, where there is
         /// no headset to read. Left null on device, so the properties above
@@ -230,6 +256,14 @@ namespace WeGo.Teleop
             Collect(RightDevice(), CommonUsages.secondaryButton, "right_b");
             Collect(LeftDevice(), CommonUsages.primary2DAxisClick, "left_thumb");
             Collect(RightDevice(), CommonUsages.primary2DAxisClick, "right_thumb");
+
+            // Local mirrors for the checklist. SkipLatched is cleared when the
+            // host leaves ALIGN, so a waiver granted in one alignment does not
+            // silently carry into the next one.
+            ConfirmHeld = GetButton(LeftDevice(), CommonUsages.gripButton)
+                       && GetButton(RightDevice(), CommonUsages.gripButton);
+            if (_pressed.Contains("left_a") || _pressed.Contains("right_a")) SkipLatched = true;
+            if (SessionState != "ALIGN") SkipLatched = false;
 
             var key = string.Join(",", _pressed);
             var due = Time.unscaledTime - _lastButtonSend >= ButtonResendInterval;

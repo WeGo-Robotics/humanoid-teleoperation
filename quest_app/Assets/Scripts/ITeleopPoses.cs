@@ -17,7 +17,10 @@ namespace WeGo.Teleop
         /// <summary>Centre-eye, floor-relative -- same convention as
         /// OVRManager.TrackingOrigin.FloorLevel.</summary>
         Vector3 Head { get; }
+        Quaternion HeadRotation { get; }
         Vector3 LeftWrist { get; }
         Vector3 RightWrist { get; }
+        Quaternion LeftWristRotation { get; }
+        Quaternion RightWristRotation { get; }
     }
 }

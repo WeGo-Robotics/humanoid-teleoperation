@@ -91,9 +91,19 @@ namespace WeGo.Teleop
             session.Port = Port;
             session.UseTls = UseTls;
 
+            // The stage renders before the HUD reads its texture, so it is
+            // added first.
+            var stage = host.AddComponent<TeleopStage>();
+            stage.Session = session;
+
             var hud = host.AddComponent<TeleopHud>();
             hud.Session = session;
+            hud.Stage = stage;
             hud.Anchor = head != null ? head.transform : transform;
+
+            // The stage figure lives on its own layer; the operator's own
+            // camera must not see it, or a second body appears in the room.
+            if (head != null) head.cullingMask &= ~(1 << TeleopStage.StageLayer);
 
             // The spatial half of the guide. Separate from the HUD on purpose:
             // the HUD is a billboard that can never leave view, while these are
@@ -101,6 +111,12 @@ namespace WeGo.Teleop
             var guide = host.AddComponent<TeleopAlignGuide>();
             guide.Session = session;
             guide.HeadAnchor = head != null ? head.transform : transform;
+
+            // Controller markers and the posture figure. Separate from the
+            // align guide because the markers have to stay up outside
+            // alignment: they are how the operator sees that tracking is live.
+            var posture = host.AddComponent<TeleopPostureGuide>();
+            posture.Session = session;
 
             host.SetActive(true);
 
