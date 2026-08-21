@@ -1187,3 +1187,72 @@ rewritten or added alongside the change (`teleop/tests/test_align.py`, up from 2
 Not yet re-verified on hardware: whether the guidance text is actually legible/actionable on the HUD panel at its
 current size, whether `--align-hold` (2.0 s) feels right for either path, and whether the eased catch-up motion after
 a skip is comfortable to stand in front of when the starting deviation is large. Worth watching on the next session.
+
+## 15. Second Quest 3 session — 2026-08-21
+
+Build, install and launch all work. `tools/build_quest_apk.ps1` produced a 45.9 MB APK in 50–150 s against Unity
+2022.3.32f1, and `adb install -r` onto the headset succeeded every time. Two mechanical notes for next time: Unity's
+Android build **kills the adb daemon**, so the device drops to `unauthorized` after every build and needs
+`adb kill-server && adb start-server`; and the default logcat ring is 256 KiB, which `VrApi` fills with a ~1 KB
+stats line every second, rotating the app's own lines out before they can be read. `adb logcat -G 16M` plus
+`setprop debug.oculus.disableVrApiStats 1` fixes that and should be the first thing done on any bring-up.
+
+### 15.1 Defect 4 is fixed, and immediately earned its keep
+
+A build made with `-Development` puts `Debug.Log` in logcat with full managed stack traces. That is the whole of the
+§14.2 defect 4 fix, and the first thing it surfaced was a defect nobody knew about — §15.2. Making the app legible
+paid for itself inside one session.
+
+### 15.2 Defect 5: a logging statement in the Meta SDK was taking down the control link
+
+`OVRManager.InitOVRManager()` throws `NullReferenceException` out of
+`XRGeneralSettings.Instance.Manager.activeLoader` (`OVRManager.cs:2461-2466`, SDK 78.0.0) when `OVRManager` is added
+at runtime rather than living in the scene. Unity surfaces an exception from a component's `Awake` back through
+`AddComponent` to the caller, so it aborted `TeleopBootstrap.Awake()` at line 60 — **`TeleopSession` and `TeleopHud`
+were never constructed**. The headset showed `DISCONNECTED` forever with not one `[XrLink]` line in logcat, because
+nothing was ever attempting to connect.
+
+Confirmed on a manual launch from inside the headset, not just an `adb`/`monkey` launch:
+
+```
+NullReferenceException: Object reference not set to an instance of an object.
+  at WeGo.Teleop.TeleopBootstrap.BuildCameraRig () TeleopBootstrap.cs:60
+  at WeGo.Teleop.TeleopBootstrap.Awake ()          TeleopBootstrap.cs:37
+```
+
+The block that throws does nothing but `Debug.Log` the active loader's settings, *after* the functional half of
+initialisation. A diagnostic statement was killing the robot's control channel.
+
+**This is the same root cause as defect 1.** §14.2 traced the frozen head pose to the centre-eye anchor never being
+driven "on a rig built at runtime through `AddComponent`". Both defects come from building the OVR rig in `Awake()`
+instead of having it in the scene. `TeleopBootstrap`'s header argues for a code-built scene over a committed
+`.unity` file, and that argument still holds for *our* objects — but `OVRManager` is not ours, and it expects normal
+scene-load ordering.
+
+**Fix, not yet done:** construct the rig in `QuestBuild.GenerateScene()` so `OVRManager` initialises under scene
+load. That is one change addressing defects 1 and 5 together, and it should land before the next hardware session.
+
+A try/catch around `AddComponent<OVRManager>()` was tried and reverted. It let `Awake()` finish, but the app then
+rendered a black screen with no HUD — a worse failure than the one it fixed, and a reminder that a half-initialised
+`OVRManager` is not a state the SDK supports. Guarding the symptom did not work; the rig has to move.
+
+### 15.3 What is still unmeasured
+
+Defects 1, 2 and 3 remain **unverified on hardware**. The `TeleopSession` rewrite compiles and installs, but no frame
+has reached a host, so none of those paths have been exercised on device. §13.3 recorded the button path as fixed on
+the strength of a `fake_quest` run and §14.2 found it dead on hardware; the same claim must not be made twice.
+
+The blocker is topology, not code. The Quest 3 has no Ethernet, and the teleop host lives on the wired
+`192.168.123.x` robot network. During this session the headset had **no network at all** — Wi-Fi disabled, loopback
+only — and `192.168.123.2` answered neither ping nor TCP 8443 from the wired side either. One of these has to be
+true before defects 1–3 can be measured:
+
+* a Wi-Fi AP bridged onto the robot network for the headset to join, or
+* the host running somewhere the headset's Wi-Fi can reach, or
+* **USB loopback** — build with `-HostAddress 127.0.0.1`, `adb reverse tcp:8443 tcp:8443`, and run `XrLinkServer`
+  standalone as the §14.3 probe. This needs only `websockets` and `numpy`, no `pinocchio`, no robot, and no open
+  port on any shared network. It is the cheapest way to close defects 1–3 and matches §13.5's bring-up order, which
+  puts the headset-with-robot-off step before the robot.
+
+The USB-loopback path was set up and confirmed working this session — `adb reverse` created the device-side
+listener — but §15.2 stopped the app before a single frame was sent.
