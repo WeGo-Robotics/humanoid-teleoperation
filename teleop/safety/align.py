@@ -49,6 +49,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from teleop.xr.transforms import WAIST_OFFSET_X, WAIST_OFFSET_Z
+
 
 @dataclass
 class AlignConfig:
@@ -58,6 +60,13 @@ class AlignConfig:
     timeout_s: float = 120.0       # give up and return to idle
     guidance_range_m: float = 0.75  # informational only: distance at which the
                                      # HUD's closeness percentage reads 0%
+    #: Must match transforms.WAIST_OFFSET_X / _Z. Imported rather than
+    #: re-typed so the two cannot drift apart: if the transform chain's offset
+    #: changes and this does not, every headset marker moves to the wrong
+    #: place while the gate itself still passes, which is the worst way for
+    #: these two to disagree.
+    waist_offset_x: float = WAIST_OFFSET_X
+    waist_offset_z: float = WAIST_OFFSET_Z
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,18 @@ class AlignReport:
     left_rot_err: float = float("inf")   # degrees
     right_rot_err: float = float("inf")
     reason: str = ""
+    #: Where the operator's wrists have to be, expressed the same way the
+    #: device expresses them: relative to the operator's own head, in robot
+    #: axes (+x front, +y left, +z up). This is the inverse of the chain in
+    #: transforms.py, which sends
+    #:     target = (op_wrist - op_head) + WAIST_OFFSET
+    #: so solving for the operator's half gives
+    #:     op_wrist - op_head = robot_fk_wrist - WAIST_OFFSET
+    #: which is exactly what a headset needs to anchor a marker in the world.
+    #: `None` when forward kinematics is unavailable -- the device must not
+    #: draw a target it cannot place.
+    left_target: Optional[Tuple[float, float, float]] = None
+    right_target: Optional[Tuple[float, float, float]] = None
 
     @property
     def worst_pos_err(self) -> float:
@@ -98,6 +119,14 @@ class AlignReport:
             "left_rot_err": clean(self.left_rot_err),
             "right_rot_err": clean(self.right_rot_err),
             "reason": self.reason,
+            # Sent as plain lists so JsonUtility on the device can deserialise
+            # them without a custom converter; omitted entirely when FK is
+            # unavailable rather than sent as zeros, which would place both
+            # markers on the operator's own head.
+            "left_target": None if self.left_target is None
+                           else [round(float(v), 4) for v in self.left_target],
+            "right_target": None if self.right_target is None
+                            else [round(float(v), 4) for v in self.right_target],
         }
 
 
@@ -123,6 +152,7 @@ class AlignGate:
         self._accepted = False
         self._last_within = False
         self._last_errs = (float("inf"), float("inf"), float("inf"), float("inf"))
+        self._last_targets = (None, None)
 
     @property
     def accepted(self) -> bool:
@@ -157,6 +187,7 @@ class AlignGate:
                                 reason="alignment timed out")
 
         left_delta = right_delta = None
+        left_target = right_target = None
         if robot_left is None or robot_right is None:
             within, lp, rp, lr, rr = False, float("inf"), float("inf"), float("inf"), float("inf")
         else:
@@ -166,7 +197,10 @@ class AlignGate:
                       and lr <= self.cfg.rot_tol_deg and rr <= self.cfg.rot_tol_deg)
             left_delta = np.asarray(robot_left)[0:3, 3] - np.asarray(operator_left)[0:3, 3]
             right_delta = np.asarray(robot_right)[0:3, 3] - np.asarray(operator_right)[0:3, 3]
+            left_target = self._head_relative_target(robot_left)
+            right_target = self._head_relative_target(robot_right)
         self._last_within, self._last_errs = within, (lp, rp, lr, rr)
+        self._last_targets = (left_target, right_target)
 
         # Both agreements must hold *continuously*; either lapsing restarts the
         # countdown. Sampling once at the end would let the operator drift out
@@ -202,6 +236,25 @@ class AlignGate:
 
         return self._report(within, operator_confirming, accepted, False, held,
                             progress, lp, rp, lr, rr, reason)
+
+    def _head_relative_target(self, robot_wrist: np.ndarray) -> Tuple[float, float, float]:
+        """Undo the waist offset so the device can place a marker.
+
+        transforms.openxr_to_robot() sends
+            target = (op_wrist - op_head) + (WAIST_OFFSET_X, 0, WAIST_OFFSET_Z)
+        and this gate compares that against FK of the robot's own joints. Where
+        the operator's hand actually has to be is therefore
+
+            op_wrist - op_head = robot_fk_wrist - WAIST_OFFSET
+
+        Note this is *not* the robot's own head-to-hand geometry: the chain
+        never uses the robot's head, only a fixed human-shaped offset, so the
+        robot's height plays no part in where the operator holds their hands.
+        """
+        p = np.asarray(robot_wrist, dtype=float)[0:3, 3]
+        return (float(p[0] - self.cfg.waist_offset_x),
+                float(p[1]),
+                float(p[2] - self.cfg.waist_offset_z))
 
     def _closeness_pct(self, pos_err: float) -> float:
         """0% at `guidance_range_m` away, 100% inside tolerance. Informational
@@ -247,8 +300,13 @@ class AlignGate:
     def _report(self, within, confirming, accepted, timed_out, held, progress,
                 lp=float("inf"), rp=float("inf"), lr=float("inf"),
                 rr=float("inf"), reason="") -> AlignReport:
+        # Targets ride on every report, including the accepted and timed-out
+        # early returns, so the device never sees a frame where the markers
+        # blink out because the gate took a different branch.
+        lt, rt = self._last_targets
         return AlignReport(
             within_tolerance=within, operator_confirming=confirming,
             accepted=accepted, timed_out=timed_out, held_s=held,
             progress=progress, left_pos_err=lp, right_pos_err=rp,
-            left_rot_err=lr, right_rot_err=rr, reason=reason)
+            left_rot_err=lr, right_rot_err=rr, reason=reason,
+            left_target=lt, right_target=rt)
