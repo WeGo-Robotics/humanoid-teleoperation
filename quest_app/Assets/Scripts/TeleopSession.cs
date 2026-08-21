@@ -21,6 +21,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using UnityEngine;
+using UnityEngine.XR;
 
 namespace WeGo.Teleop
 {
@@ -33,10 +34,6 @@ namespace WeGo.Teleop
 
         [Header("Input")]
         public bool HandTracking = false;   // controllers first; see docs 12.2
-
-        [Header("Scene")]
-        [Tooltip("Centre-eye anchor. Falls back to Camera.main when unset.")]
-        public Transform HeadTransform;
 
         [Header("Read-only state for the UI")]
         public string SessionState = "DISCONNECTED";
@@ -63,6 +60,9 @@ namespace WeGo.Teleop
         private string _lastButtonKey = null;
         private float _lastButtonSend;
         private bool _estopLatched;
+
+        private const float DiagLogInterval = 1.0f;
+        private float _lastDiagLog;
 
         // ------------------------------------------------------------------
         // lifecycle
@@ -155,8 +155,8 @@ namespace WeGo.Teleop
         /// decides what a stop means; this only asks.</summary>
         private void PollEstop()
         {
-            var held = OVRInput.Get(OVRInput.Button.Two, OVRInput.Controller.LTouch) &&
-                       OVRInput.Get(OVRInput.Button.Two, OVRInput.Controller.RTouch);
+            var held = GetButton(LeftDevice(), CommonUsages.secondaryButton) &&
+                       GetButton(RightDevice(), CommonUsages.secondaryButton);
             if (held && !_estopLatched)
             {
                 _estopLatched = true;
@@ -177,14 +177,12 @@ namespace WeGo.Teleop
         private void PollButtons()
         {
             _pressed.Clear();
-            Collect(OVRInput.Button.One, OVRInput.Controller.LTouch, "left_a");
-            Collect(OVRInput.Button.One, OVRInput.Controller.RTouch, "right_a");
-            Collect(OVRInput.Button.Two, OVRInput.Controller.LTouch, "left_b");
-            Collect(OVRInput.Button.Two, OVRInput.Controller.RTouch, "right_b");
-            Collect(OVRInput.Button.PrimaryThumbstick, OVRInput.Controller.LTouch,
-                    "left_thumb");
-            Collect(OVRInput.Button.PrimaryThumbstick, OVRInput.Controller.RTouch,
-                    "right_thumb");
+            Collect(LeftDevice(), CommonUsages.primaryButton, "left_a");
+            Collect(RightDevice(), CommonUsages.primaryButton, "right_a");
+            Collect(LeftDevice(), CommonUsages.secondaryButton, "left_b");
+            Collect(RightDevice(), CommonUsages.secondaryButton, "right_b");
+            Collect(LeftDevice(), CommonUsages.primary2DAxisClick, "left_thumb");
+            Collect(RightDevice(), CommonUsages.primary2DAxisClick, "right_thumb");
 
             var key = string.Join(",", _pressed);
             var due = Time.unscaledTime - _lastButtonSend >= ButtonResendInterval;
@@ -195,10 +193,52 @@ namespace WeGo.Teleop
             _link.SendButtons(_pressed);
         }
 
-        private void Collect(OVRInput.Button button, OVRInput.Controller controller,
-                             string name)
+        // ------------------------------------------------------------------
+        // input devices
+        //
+        // Deliberately NOT OVRInput.Get(Button/Axis, Controller) below. That
+        // path (and OVRInput.IsControllerConnected/GetConnectedControllers)
+        // all resolve through OVRPlugin.GetControllerState6, and on-device
+        // measurement (docs 14) showed that call's ConnectedControllers and
+        // Buttons bits both come back empty for real hardware even while the
+        // node-tracking pipe (GetLocalControllerPosition/PositionTracked,
+        // used above) works. UnityEngine.XR's InputDevice/CommonUsages read
+        // through the XR input subsystem instead -- a separate pipe from
+        // GetControllerState6, same family as the InputTracking head-pose fix.
+        // ------------------------------------------------------------------
+        private InputDevice _leftDevice;
+        private InputDevice _rightDevice;
+
+        private InputDevice LeftDevice()
         {
-            if (OVRInput.Get(button, controller)) _pressed.Add(name);
+            if (!_leftDevice.isValid) _leftDevice = InputDevices.GetDeviceAtXRNode(XRNode.LeftHand);
+            return _leftDevice;
+        }
+
+        private InputDevice RightDevice()
+        {
+            if (!_rightDevice.isValid) _rightDevice = InputDevices.GetDeviceAtXRNode(XRNode.RightHand);
+            return _rightDevice;
+        }
+
+        private static bool GetButton(InputDevice device, InputFeatureUsage<bool> usage)
+        {
+            return device.TryGetFeatureValue(usage, out var pressed) && pressed;
+        }
+
+        private void Collect(InputDevice device, InputFeatureUsage<bool> usage, string name)
+        {
+            if (GetButton(device, usage)) _pressed.Add(name);
+        }
+
+        private static float TriggerValue(InputDevice device)
+        {
+            return device.TryGetFeatureValue(CommonUsages.trigger, out var v) ? v : 0f;
+        }
+
+        private static Vector2 ThumbstickValue(InputDevice device)
+        {
+            return device.TryGetFeatureValue(CommonUsages.primary2DAxis, out var v) ? v : Vector2.zero;
         }
 
         private TrackingSample BuildSample()
@@ -210,24 +250,54 @@ namespace WeGo.Teleop
             var ovr = OVRManager.instance;
             IsWorn = ovr != null && ovr.isUserPresent;
 
-            var leftOk = OVRInput.IsControllerConnected(OVRInput.Controller.LTouch);
-            var rightOk = OVRInput.IsControllerConnected(OVRInput.Controller.RTouch);
+            // IsControllerConnected() reports pairing state from the legacy
+            // GetControllerState6 pipe, which came back false for both real
+            // Touch controllers on device even while they streamed live poses
+            // (docs 14.2 defect 2/3). GetControllerPositionTracked() reads the
+            // node-tracking pipe directly -- the same one PoseOf() below already
+            // relies on -- so this is what "the controller is actually usable"
+            // means here, not just "paired".
+            var leftOk = OVRInput.GetControllerPositionTracked(OVRInput.Controller.LTouch);
+            var rightOk = OVRInput.GetControllerPositionTracked(OVRInput.Controller.RTouch);
 
-            var head = Head();
-            var headPose = head != null
-                ? Matrix4x4.TRS(head.position, head.rotation, Vector3.one)
-                : Matrix4x4.identity;
+            // Do not resolve the head through OVRCameraRig's anchor: on device
+            // that anchor only updates when OVRNodeStateProperties.IsHmdPresent()
+            // is true, and it measured false for the whole session, freezing
+            // centerEyeAnchor at the identity pose (docs 14.2 defect 1, 14.3).
+            // InputTracking reads the CenterEye node the same unconditional way
+            // PoseOf() reads controller nodes, with no such gate.
+            var headPose = Matrix4x4.TRS(InputTracking.GetLocalPosition(XRNode.CenterEye),
+                                         InputTracking.GetLocalRotation(XRNode.CenterEye),
+                                         Vector3.one);
             var leftPose = PoseOf(OVRInput.Controller.LTouch);
             var rightPose = PoseOf(OVRInput.Controller.RTouch);
 
             // Analog inputs follow the host's inverted convention: 10.0 fully
             // open, 0.0 fully pressed. Matching it here means the gripper code
-            // needs no per-source special-casing.
+            // needs no per-source special-casing. Read via the same InputDevice
+            // path as buttons above, not OVRInput.Get(Axis1D/Axis2D, Controller)
+            // -- that also resolves through the GetControllerState6 struct that
+            // measured empty on device (docs 14.2 defect 2/3).
             float Inverted(float t) => Mathf.Clamp(10.0f - t * 10.0f, 0.0f, 10.0f);
-            var lTrig = Inverted(OVRInput.Get(OVRInput.Axis1D.PrimaryIndexTrigger,
-                                              OVRInput.Controller.LTouch));
-            var rTrig = Inverted(OVRInput.Get(OVRInput.Axis1D.PrimaryIndexTrigger,
-                                              OVRInput.Controller.RTouch));
+            var lTrig = Inverted(TriggerValue(LeftDevice()));
+            var rTrig = Inverted(TriggerValue(RightDevice()));
+            var lThumb = ThumbstickValue(LeftDevice());
+            var rThumb = ThumbstickValue(RightDevice());
+
+            // Once-a-second, not per-frame: the head-pose and tracked-state
+            // fixes above were only trustworthy once this line could actually
+            // be read on device (docs 14.2 defect 4 -- Debug.Log is stripped
+            // from a non-Development build). Buttons stayed empty for the
+            // whole first session; this is what settles whether they still do.
+            if (Time.unscaledTime - _lastDiagLog >= DiagLogInterval)
+            {
+                _lastDiagLog = Time.unscaledTime;
+                Debug.Log($"[Teleop] diag leftDeviceValid={LeftDevice().isValid} " +
+                          $"rightDeviceValid={RightDevice().isValid} " +
+                          $"leftTracked={leftOk} rightTracked={rightOk} " +
+                          $"head=({headPose.GetColumn(3).x:F3},{headPose.GetColumn(3).y:F3},{headPose.GetColumn(3).z:F3}) " +
+                          $"trig=({lTrig:F2},{rTrig:F2}) pressed=({string.Join(",", _pressed)})");
+            }
 
             return new TrackingSample
             {
@@ -243,22 +313,9 @@ namespace WeGo.Teleop
                 RightTrigger = rTrig,
                 LeftPinch = lTrig,     // controllers: pinch mirrors trigger
                 RightPinch = rTrig,
-                LeftThumb = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick,
-                                         OVRInput.Controller.LTouch),
-                RightThumb = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick,
-                                          OVRInput.Controller.RTouch),
+                LeftThumb = lThumb,
+                RightThumb = rThumb,
             };
-        }
-
-        /// <summary>Resolved lazily: Camera.main is null during Awake if the
-        /// camera rig has not spawned yet, and a head pose stuck at the origin
-        /// reads to the host as a perfectly still operator rather than a
-        /// missing one.</summary>
-        private Transform Head()
-        {
-            if (HeadTransform != null) return HeadTransform;
-            if (Camera.main != null) HeadTransform = Camera.main.transform;
-            return HeadTransform;
         }
 
         private static Matrix4x4 PoseOf(OVRInput.Controller c)
