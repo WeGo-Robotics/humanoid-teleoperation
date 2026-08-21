@@ -209,7 +209,12 @@ namespace WeGo.Teleop
             if (dir.sqrMagnitude < 1e-6f) dir = Vector2.right;
             dir.Normalize();
 
-            const float dist = 1.0f, extent = 0.34f, size = 0.045f;
+            // Pushed out to 32 degrees off-axis. The console spans about 30
+            // degrees at the distance TeleopHud parks it, and at the previous
+            // 19 degrees these chevrons were drawn straight across the middle
+            // of it -- two red arrows over the readouts they were supposed to
+            // be sending the operator to.
+            const float dist = 1.0f, extent = 0.62f, size = 0.05f;
             var centre = cam.position + cam.forward * dist
                        + cam.right * dir.x * extent + cam.up * dir.y * extent;
             var tip = cam.right * dir.x + cam.up * dir.y;
