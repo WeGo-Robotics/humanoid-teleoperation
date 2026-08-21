@@ -39,7 +39,7 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QSizePolicy, QTextEdit, QComboBox, QLineEdit, QToolButton,
-    QButtonGroup, QDialog,
+    QButtonGroup, QDialog, QScrollArea,
 )
 
 # ----------------------------------------------------------------------------
@@ -986,8 +986,11 @@ class Dashboard(QWidget):
         self.stage.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         body.addWidget(self.stage, 1)
 
+        # The side column lives inside a scroll area so that expanding the
+        # settings accordion scrolls instead of growing the window: a plain
+        # child widget propagates its minimum height up to the window, which
+        # forces a resize the moment the accordion opens.
         side = QWidget()
-        side.setFixedWidth(340)
         side.setStyleSheet(f"background:{C['bg']};")
         sl = QVBoxLayout(side)
         sl.setContentsMargins(24, 24, 24, 24)
@@ -998,7 +1001,22 @@ class Dashboard(QWidget):
         sl.addWidget(self._status_card())
         sl.addWidget(self._log_card(), 1)
 
-        body.addWidget(side)
+        side_scroll = QScrollArea()
+        side_scroll.setWidget(side)
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFixedWidth(340)
+        side_scroll.setFrameShape(QFrame.NoFrame)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        side_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        side_scroll.setStyleSheet(
+            f"QScrollArea{{background:{C['bg']};border:none;}}"
+            "QScrollBar:vertical{background:transparent;width:8px;margin:6px 2px 6px 0;}"
+            "QScrollBar::handle:vertical{background:#c9c9c4;min-height:28px;border-radius:4px;}"
+            "QScrollBar::handle:vertical:hover{background:#a9a9a2;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}")
+
+        body.addWidget(side_scroll)
         root.addLayout(body, 1)
 
     def _card(self):
@@ -1466,6 +1484,9 @@ class Dashboard(QWidget):
             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
             "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}")
         self.log_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # keeps the log readable when the settings accordion is open: without
+        # a floor the side column squashes it before the scroll area scrolls
+        self.log_box.setMinimumHeight(140)
         v.addWidget(self.log_box, 1)
         self._log_lines = []
         return card
