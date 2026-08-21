@@ -315,6 +315,62 @@ class TestGuidanceText(unittest.TestCase):
         self.assertNotIn("right", report.reason)
 
 
+class TestHeadRelativeTargets(unittest.TestCase):
+    """The device cannot anchor a marker from a scalar distance. These are the
+
+    3D positions the headset places its rings at, and they must stay the exact
+    inverse of the chain in transforms.py -- if they drift, every marker moves
+    while the gate itself still passes."""
+
+    def test_target_is_fk_wrist_minus_the_waist_offset(self):
+        from safety.align import AlignConfig as C
+        cfg = AlignConfig()
+        rig = Rig()
+        report = rig.step()
+        # ROBOT_L sits at (0.15, 0.25, 0.45) in the pelvis frame
+        self.assertAlmostEqual(report.left_target[0], 0.15 - cfg.waist_offset_x, places=6)
+        self.assertAlmostEqual(report.left_target[1], 0.25, places=6)
+        self.assertAlmostEqual(report.left_target[2], 0.45 - cfg.waist_offset_z, places=6)
+
+    def test_waist_offset_matches_the_transform_chain(self):
+        """A copy of the constant would let the two drift apart silently."""
+        from xr.transforms import WAIST_OFFSET_X, WAIST_OFFSET_Z
+        cfg = AlignConfig()
+        self.assertEqual(cfg.waist_offset_x, WAIST_OFFSET_X)
+        self.assertEqual(cfg.waist_offset_z, WAIST_OFFSET_Z)
+
+    def test_no_target_when_fk_is_unavailable(self):
+        """Sending zeros would put both rings on the operator's own head."""
+        gate = AlignGate(AlignConfig(hold_s=0.2))
+        gate.reset(0.0)
+        report = gate.update(0.03, None, None, ROBOT_L, ROBOT_R, False)
+        self.assertIsNone(report.left_target)
+        self.assertIsNone(report.right_target)
+        self.assertIsNone(report.as_dict()["left_target"])
+
+    def test_targets_survive_acceptance_and_timeout_branches(self):
+        """The markers must not blink out when the gate changes branch."""
+        rig = Rig(AlignConfig(hold_s=0.2))
+        rig.confirming = True
+        accepted = rig.run(0.6)
+        self.assertTrue(accepted.accepted)
+        self.assertIsNotNone(accepted.left_target)
+
+        rig2 = Rig(AlignConfig(timeout_s=0.5))
+        rig2.confirming = False
+        timed = rig2.run(1.0)
+        self.assertTrue(timed.timed_out)
+        self.assertIsNotNone(timed.left_target)
+
+    def test_as_dict_targets_are_json_safe_lists(self):
+        import json
+        rig = Rig()
+        d = rig.step().as_dict()
+        json.dumps(d)
+        self.assertIsInstance(d["left_target"], list)
+        self.assertEqual(len(d["left_target"]), 3)
+
+
 class TestTelemetry(unittest.TestCase):
     def test_as_dict_is_json_safe(self):
         import json

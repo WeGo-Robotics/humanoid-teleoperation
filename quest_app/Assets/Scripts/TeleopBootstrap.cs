@@ -47,6 +47,13 @@ namespace WeGo.Teleop
             var hud = gameObject.AddComponent<TeleopHud>();
             hud.Session = session;
             hud.Anchor = head != null ? head.transform : transform;
+
+            // The spatial half of the guide. Separate from the HUD on purpose:
+            // the HUD is a billboard that can never leave view, while these are
+            // objects in the room that are supposed to.
+            var guide = gameObject.AddComponent<TeleopAlignGuide>();
+            guide.Session = session;
+            guide.HeadAnchor = head != null ? head.transform : transform;
         }
 
         /// <summary>OVRCameraRig builds its own anchor hierarchy in Awake via

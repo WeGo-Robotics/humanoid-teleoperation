@@ -44,6 +44,29 @@ namespace WeGo.Teleop
         public int SkippedFrames;
         public string HostUrl = "";
 
+        /// <summary>Where the operator's wrists have to be for the gate to
+        /// pass, in Unity world space. The host sends these head-relative in
+        /// robot axes; <see cref="ToUnityOffset"/> turns them back into this
+        /// app's frame and <see cref="HeadPosition"/> anchors them.
+        ///
+        /// Valid only while <see cref="HasAlignTargets"/> is true -- forward
+        /// kinematics can be unavailable, and a marker drawn from a fabricated
+        /// pose would send the operator to a place the robot never asked for.</summary>
+        public Vector3 LeftAlignTarget => HeadPosition + _leftTargetOffset;
+        public Vector3 RightAlignTarget => HeadPosition + _rightTargetOffset;
+        public bool HasAlignTargets;
+        public bool AlignWithinTolerance;
+        public float LeftPosError = float.PositiveInfinity;
+        public float RightPosError = float.PositiveInfinity;
+
+        /// <summary>Live centre-eye position, the same read the tracking frame
+        /// is built from, so the guide and the wire cannot disagree about where
+        /// the operator's head is.</summary>
+        public Vector3 HeadPosition => InputTracking.GetLocalPosition(XRNode.CenterEye);
+
+        public Vector3 LeftWristPosition => OVRInput.GetLocalControllerPosition(OVRInput.Controller.LTouch);
+        public Vector3 RightWristPosition => OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
+
         /// <summary>Both secondary face buttons (Y on the left controller, B on
         /// the right). Chosen because it is symmetric, reachable without
         /// looking, and not bound to anything else -- A/X already quit the
@@ -341,6 +364,27 @@ namespace WeGo.Teleop
             return Matrix4x4.TRS(flippedPos, flippedRot, Vector3.one);
         }
 
+        /// <summary>Robot axes (+x front, +y left, +z up) -> Unity
+        /// (+x right, +y up, +z forward), for a translation only.
+        ///
+        /// This is the inverse of the two hops an outgoing pose makes:
+        /// Unity -> OpenXR is the z-negation in <see cref="ToOpenXR"/>, and
+        /// OpenXR -> robot is T_ROBOT_OPENXR in the host's transforms.py.
+        /// Composing the inverses collapses to a relabelling:
+        ///
+        ///     unity.x = -robot.y     (robot's left is the operator's -x)
+        ///     unity.y =  robot.z     (both call up "up")
+        ///     unity.z =  robot.x     (robot's front is the operator's forward)
+        ///
+        /// Translation only, deliberately: transforms.py subtracts the head
+        /// position without rotating, so these offsets are in world axes and
+        /// must not be re-oriented by head yaw here.</summary>
+        internal static Vector3 ToUnityOffset(float[] robot)
+        {
+            if (robot == null || robot.Length < 3) return Vector3.zero;
+            return new Vector3(-robot[1], robot[2], robot[0]);
+        }
+
         // ------------------------------------------------------------------
         // host -> device
         // ------------------------------------------------------------------
@@ -357,11 +401,13 @@ namespace WeGo.Teleop
                             SessionState = msg.session ?? SessionState;
                             AlignReason = msg.reason ?? "";
                             AlignProgress = msg.align != null ? msg.align.progress : 0f;
+                            ApplyAlignTargets(msg.align);
                             break;
                         case "abort":
                             SessionState = "ABORTED";
                             AlignReason = msg.reason ?? "";
                             AlignProgress = 0f;
+                            HasAlignTargets = false;
                             break;
                     }
                 }
@@ -372,7 +418,48 @@ namespace WeGo.Teleop
             }
         }
 
-        [Serializable] private class AlignPayload { public float progress; public string reason; }
+        /// <summary>Store the host's targets as head-relative offsets.
+        ///
+        /// Deliberately not baked into world points here. The gate's condition
+        /// is on `op_wrist - op_head`, so the required wrist position moves
+        /// with the head: step forward and your hand has to come with you or
+        /// the offset changes and the hold resets. Freezing a world point at
+        /// message-arrival time would leave the marker behind and quietly ask
+        /// the operator for a pose the host is not checking. The world position
+        /// is therefore derived per frame in the properties below, which also
+        /// makes the markers update at frame rate rather than message rate.</summary>
+        private void ApplyAlignTargets(AlignPayload align)
+        {
+            var ok = align != null
+                     && align.left_target != null && align.left_target.Length >= 3
+                     && align.right_target != null && align.right_target.Length >= 3;
+            if (!ok)
+            {
+                HasAlignTargets = false;
+                return;
+            }
+            _leftTargetOffset = ToUnityOffset(align.left_target);
+            _rightTargetOffset = ToUnityOffset(align.right_target);
+            AlignWithinTolerance = align.within_tolerance;
+            LeftPosError = align.left_pos_err;
+            RightPosError = align.right_pos_err;
+            HasAlignTargets = true;
+        }
+
+        private Vector3 _leftTargetOffset, _rightTargetOffset;
+
+        [Serializable] private class AlignPayload
+        {
+            public float progress;
+            public string reason;
+            public bool within_tolerance;
+            public float left_pos_err, right_pos_err;
+            // Head-relative, robot axes (+x front, +y left, +z up). Null on the
+            // wire when the host has no forward kinematics; JsonUtility gives a
+            // zero-length array for that, which AlignGuide reads as "no target"
+            // rather than placing a marker on the operator's own head.
+            public float[] left_target, right_target;
+        }
         [Serializable] private class HostMessage
         {
             public string t, session, reason;

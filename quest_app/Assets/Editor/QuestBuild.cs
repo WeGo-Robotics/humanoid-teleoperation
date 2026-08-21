@@ -145,7 +145,41 @@ namespace WeGo.Teleop.Editor
             if (!opt.UseTls)
                 Warn("cleartext ws:// is enabled -- isolated lab network only");
 
+            EnsureLineShaderIncluded();
+
             AssetDatabase.SaveAssets();
+        }
+
+        /// <summary>Keep Sprites/Default in the build.
+        ///
+        /// TeleopAlignGuide builds its LineRenderer material with
+        /// Shader.Find at runtime, and a shader referenced only by Shader.Find
+        /// is invisible to the build's dependency walk -- it gets stripped, the
+        /// material comes back magenta or blank, and the alignment rings simply
+        /// do not appear. That failure looks exactly like a tracking problem
+        /// from inside the headset, which is the worst way to spend a hardware
+        /// session, so it is pinned here rather than left to chance.</summary>
+        private static void EnsureLineShaderIncluded()
+        {
+            var shader = Shader.Find("Sprites/Default");
+            if (shader == null) { Warn("Sprites/Default not found; align rings may not render"); return; }
+
+            var settings = AssetDatabase
+                .LoadAllAssetsAtPath("ProjectSettings/GraphicsSettings.asset")
+                .FirstOrDefault();
+            if (settings == null) { Warn("no GraphicsSettings; cannot pin the line shader"); return; }
+
+            var so = new SerializedObject(settings);
+            var list = so.FindProperty("m_AlwaysIncludedShaders");
+            if (list == null) { Warn("no m_AlwaysIncludedShaders property"); return; }
+
+            for (var i = 0; i < list.arraySize; i++)
+                if (list.GetArrayElementAtIndex(i).objectReferenceValue == shader) return;
+
+            list.InsertArrayElementAtIndex(list.arraySize);
+            list.GetArrayElementAtIndex(list.arraySize - 1).objectReferenceValue = shader;
+            so.ApplyModifiedProperties();
+            Log("pinned Sprites/Default into Always Included Shaders");
         }
 
         // ------------------------------------------------------------------
