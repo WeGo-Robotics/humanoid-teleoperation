@@ -37,10 +37,11 @@ namespace WeGo.Teleop
         [Header("Placement")]
         [Tooltip("Metres in front of the head.")]
         public float Distance = 1.45f;
-        [Tooltip("Metres below eye level. The console is tall, so this is a " +
-                 "small drop -- enough to keep the horizon clear without " +
-                 "pushing the top of the panel out of view.")]
-        public float Drop = 0.18f;
+        [Tooltip("Degrees below eye level for the TOP edge of the console. " +
+                 "The drop is derived from this and the panel's own height, " +
+                 "rather than being a fixed distance, so the console stays " +
+                 "hung off the horizon whatever size the layout grows to.")]
+        public float TopEdgeBelowHorizon = 3f;
         [Tooltip("Seconds for the console to catch up. Non-zero so it does not " +
                  "feel welded to the face, which is a reliable way to make " +
                  "someone motion sick.")]
@@ -96,6 +97,7 @@ namespace WeGo.Teleop
         private Text _gaugePct, _gaugeTier, _gaugeMsg, _voice;
         private Image _pillBorder, _gaugeFill;
         private RawImage _stageImage;
+        private Text _stageCaption;
         private Image _confirmFill, _skipFill;
         private Text _confirmLabel, _skipLabel;
         private RectTransform _confirmFillRect, _skipFillRect;
@@ -151,7 +153,17 @@ namespace WeGo.Teleop
             if (forward.sqrMagnitude < 1e-4f) forward = Vector3.forward;
             forward.Normalize();
 
-            var target = headPos + forward * Distance + Vector3.down * Drop;
+            // Hung from the horizon rather than parked at a fixed depth: the
+            // top edge sits TopEdgeBelowHorizon degrees below eye level and the
+            // rest of the panel hangs beneath it. A constant drop put the top
+            // of a 1.18 m console fifteen degrees ABOVE the eye line, which is
+            // what made it read as too high -- and it would drift again every
+            // time the layout changed height.
+            var halfHeight = H * MetresPerUnit * 0.5f;
+            var drop = Distance * Mathf.Tan(TopEdgeBelowHorizon * Mathf.Deg2Rad)
+                     + halfHeight;
+
+            var target = headPos + forward * Distance + Vector3.down * drop;
             var look = Quaternion.LookRotation(target - headPos, Vector3.up);
 
             // Framerate-independent smoothing; a plain Lerp factor would make
@@ -189,6 +201,19 @@ namespace WeGo.Teleop
             _sub.text = aligning
                 ? "Make sure your hands are inside the targets"
                 : "";
+
+            // The camera stream owns the stage whenever the host is sending
+            // one; the G1 model is what fills it until then.
+            var camera = Session.CameraTexture;
+            var wanted = camera != null ? camera
+                       : (Stage != null ? Stage.Output : null);
+            if (wanted != null && _stageImage.texture != wanted)
+            {
+                _stageImage.texture = wanted;
+                _stageCaption.text = camera != null
+                    ? "head camera · live"
+                    : "reference pose · rings are your wrist targets";
+            }
 
             var p = Mathf.Clamp01(Session.AlignProgress);
             RenderGauge(aligning ? p : 0f, aligning);
@@ -553,9 +578,11 @@ namespace WeGo.Teleop
                       new Vector2(bw, bh));
             }
 
-            Label(frame, 20, FontStyle.Normal, new Color(0.59f, 0.84f, 0.71f, 0.34f),
-                  TextAnchor.LowerLeft, new Vector2(14f, -StageH + 30f),
-                  new Vector2(520f, 26f)).text = "reference pose · rings are your wrist targets";
+            _stageCaption = Label(frame, 20, FontStyle.Normal,
+                                  new Color(0.59f, 0.84f, 0.71f, 0.34f),
+                                  TextAnchor.LowerLeft, new Vector2(14f, -StageH + 30f),
+                                  new Vector2(520f, 26f));
+            _stageCaption.text = "reference pose · rings are your wrist targets";
 
             BuildAlignBar(root, ColTop - StageH - Gap);
         }

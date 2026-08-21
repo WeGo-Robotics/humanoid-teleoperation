@@ -78,6 +78,19 @@ class XrLinkServer:
         self._ready = threading.Event()
         self._running = False
 
+        # Head-camera video. Counters are plain ints touched only from the
+        # caller's thread and the loop's done-callback, both of which run one
+        # at a time per frame, so they need no lock -- they are diagnostics,
+        # not control.
+        self.video_sent = 0
+        self.video_dropped = 0
+        self._video_inflight = 0
+
+    #: Frames allowed on the wire at once before new ones are dropped. One in
+    #: flight plus one queued: enough to keep the link busy, few enough that a
+    #: slow socket cannot build a backlog the operator would see as lag.
+    _VIDEO_MAX_INFLIGHT = 2
+
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
@@ -278,6 +291,50 @@ class XrLinkServer:
             logger_mp.warning(f"[XrLink] send failed: {e!r}")
             return False
         return True
+
+    def send_video(self, jpeg: bytes) -> bool:
+        """Queue one head-camera frame to the device, as a binary frame.
+
+        Binary rather than a base64 field on a control message: at 30 fps a
+        third more bytes on every frame is real bandwidth, and it keeps video
+        off the same path as the messages that stop the robot. The device
+        tells the two apart by opcode.
+
+        Frames are dropped rather than queued when the socket is behind. A
+        late video frame has no value -- the next one is already better -- and
+        letting them accumulate would put latency on the control channel they
+        share.
+        """
+        ws, loop = self._client, self._loop
+        if ws is None or loop is None or not jpeg:
+            return False
+
+        if self._video_inflight >= self._VIDEO_MAX_INFLIGHT:
+            self.video_dropped += 1
+            return False
+
+        self._video_inflight += 1
+
+        def _done(_):
+            self._video_inflight -= 1
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._send_bytes(ws, jpeg), loop)
+            fut.add_done_callback(_done)
+        except Exception as e:
+            self._video_inflight -= 1
+            logger_mp.warning(f"[XrLink] video send failed: {e!r}")
+            return False
+
+        self.video_sent += 1
+        return True
+
+    @staticmethod
+    async def _send_bytes(ws, payload: bytes):
+        try:
+            await ws.send(payload)
+        except Exception as e:
+            logger_mp.debug(f"[XrLink] video frame dropped: {e!r}")
 
     @staticmethod
     async def _send(ws, text):
