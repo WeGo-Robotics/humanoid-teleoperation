@@ -190,5 +190,114 @@ class TestQuestAppMatchesTheWireFormat(unittest.TestCase):
                          f"the app sends buttons the host drops: {sorted(unknown)}")
 
 
+    def test_the_apps_confirm_gesture_is_one_the_host_can_see(self):
+        """Build 13's console asked for the grips.
+
+        Grip is not a button name, not an input field, and not a bit anywhere
+        on the wire -- so the host could never see it, XRFrame.confirm_gesture
+        was false for the whole session, and the align gate could not be
+        passed or skipped. The console meanwhile lit its own HOLD CONFIRM bar
+        off the local grip state, so the app looked right and the host looked
+        broken. Nothing in the 182 host tests could catch that, because the
+        gesture is chosen on the device.
+        """
+        src = self.source("TeleopSession.cs")
+        confirm = [ln for ln in src.splitlines() if "ConfirmHeld =" in ln]
+        self.assertTrue(confirm, "TeleopSession no longer assigns ConfirmHeld")
+        joined = " ".join(confirm)
+        self.assertNotIn("gripButton", joined,
+                         "the app confirms on the grips, which never reach the "
+                         "host -- see XRFrame.confirm_gesture")
+        self.assertIn("Trigger", joined,
+                      "the host's confirm_gesture is both triggers (or both "
+                      "pinches) and nothing else can satisfy it")
+
+    def test_the_confirm_threshold_matches_the_hosts(self):
+        """The host tests `trigger_value < 1.0` on the inverted 10.0-open
+
+        scale, which is a raw pull above 0.9. If the app picks a different
+        number the two disagree near the edge, and the operator gets a console
+        that ticks confirm while the hold does not accumulate."""
+        src = self.source("TeleopSession.cs")
+        self.assertIn("ConfirmTriggerRaw = 0.9f;", src)
+        from xr.native_source import _IDENTITY  # noqa: F401  (module imports)
+        import inspect
+        from xr import native_source
+        host = inspect.getsource(native_source)
+        self.assertIn('inputs.get("left_trigger_value", 10.0) < 1.0', host)
+
+    def test_the_console_tells_the_operator_the_gesture_it_sends(self):
+        """The prompt and the binding have to name the same finger. They did
+
+        not in build 13, and an operator following the console exactly could
+        not pass the gate."""
+        hud = self.source("TeleopHud.cs")
+        self.assertNotIn("grips to confirm", hud)
+        self.assertIn("triggers to confirm", hud)
+
+    def test_the_stage_mirror_is_not_gated_on_the_texture_changing(self):
+        """The flip has to be re-asserted every frame, not set once when the
+
+        stage texture is swapped in.
+
+        Build 13's version lived inside `if (_stageImage.texture != wanted)`.
+        BuildStageColumn already assigns Stage.Output at construction time, so
+        on the ALIGN path the texture never changes, the branch never ran, and
+        the panel stayed unmirrored for the whole of the one state the mirror
+        exists to serve -- the operator's left hand on the right of the panel,
+        every correction reversed. The fix that shipped in the commit before
+        this one was real and was dead code.
+
+        Checked by indentation, which is crude, but the alternative is a Unity
+        licence in CI (see this class's docstring). Twelve spaces is method
+        body; sixteen is inside a branch.
+        """
+        src = self.source("TeleopHud.cs")
+        hits = [ln for ln in src.splitlines()
+                if ln.strip().startswith("_stageImage.uvRect")]
+        self.assertTrue(hits, "TeleopHud never sets the stage uvRect")
+        for line in hits:
+            indent = len(line) - len(line.lstrip())
+            self.assertEqual(
+                indent, 12,
+                "the stage mirror is nested inside a branch; it must run every "
+                f"frame. Offending line: {line.strip()!r}")
+
+    def test_the_console_does_not_hold_a_tolerance_of_its_own(self):
+        """TeleopHud used to tick each hand's checklist row by testing the
+
+        reported error against a private `PosTolerance = 0.10f`. That number
+        was the absolute gate's, and once the host moved to a scale-free check
+        the console was applying a rule the host was not. The verdict now comes
+        down the wire per wrist (AlignReport.left_ok) and the console renders
+        it. This guards against the constant creeping back."""
+        hud = self.source("TeleopHud.cs")
+        self.assertNotIn("PosTolerance", hud)
+        self.assertIn("Session.LeftInPosition", hud)
+        self.assertIn("Session.RightInPosition", hud)
+
+    def test_passthrough_waits_for_the_sdk_before_clearing_transparent(self):
+        """A camera clearing to transparent with nothing composited behind it
+
+        renders black, so the app must not do it on the strength of having
+        asked for passthrough. Initialisation is asynchronous -- OVRManager
+        parks at PassthroughInitializationState.Pending and a later frame moves
+        it to Initialized -- and it can fail outright. Build 13 set the clear
+        in the same frame as the request and treated "OVRManager exists" as
+        "passthrough is on", which is why the operator got a console floating
+        in a void instead of the room and the instructor standing in it.
+        """
+        pt = self.source("TeleopPassthrough.cs")
+        self.assertIn("IsInsightPassthroughInitialized", pt,
+                      "passthrough must be confirmed up, not assumed")
+        self.assertIn("HasInsightPassthroughInitFailed", pt,
+                      "a failed initialisation has to be distinguishable from "
+                      "a slow one, or the log cannot say which happened")
+
+        boot = self.source("TeleopBootstrap.cs")
+        self.assertNotIn("OVRPassthroughLayer", boot,
+                         "the passthrough layer belongs to TeleopPassthrough, "
+                         "which knows when it is safe to create one")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

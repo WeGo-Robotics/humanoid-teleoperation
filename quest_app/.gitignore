@@ -16,6 +16,12 @@
 /Assets/XR/
 /Assets/XR.meta
 
+# Written into Assets/ by the Meta SDK during a build, not authored. Same
+# reasoning as Assets/Scenes above: it is an output of building, and committing
+# it would mean every build shows up as a source change.
+/Assets/StreamingAssets/
+/Assets/StreamingAssets.meta
+
 # Scratch directory the Meta SDK creates on import and leaves empty.
 /Assets/Oculus/
 /Assets/Oculus.meta

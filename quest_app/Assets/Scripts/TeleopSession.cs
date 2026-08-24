@@ -57,7 +57,17 @@ namespace WeGo.Teleop
         public bool HasAlignTargets;
         public bool AlignWithinTolerance;
 
-        /// <summary>Both grips held; and X and A held together. Read locally
+        /// <summary>The host's verdict on each wrist, not the device's.
+        ///
+        /// The checklist used to test LeftPosError against a 0.10f constant of
+        /// its own. That constant was the absolute gate's tolerance, and once
+        /// the host moved to a scale-free check (docs 16.3) the two no longer
+        /// agreed -- the console would have ticked, or refused to tick, on a
+        /// rule the host was not applying. A readout that decides for itself
+        /// what the host means is the defect that cost builds 12 and 13.</summary>
+        public bool LeftInPosition, RightInPosition;
+
+        /// <summary>Both triggers held; and X and A held together. Read locally
         /// rather than echoed back from the host, because the checklist has to
         /// respond the instant the operator squeezes and a round trip would
         /// make it lag by a message. Nothing gates on these -- the host still
@@ -316,8 +326,8 @@ namespace WeGo.Teleop
             Collect(RightDevice(), CommonUsages.primary2DAxisClick, "right_thumb");
 
             // Local mirrors for the checklist, matching what the host tests.
-            ConfirmHeld = GetButton(LeftDevice(), CommonUsages.gripButton)
-                       && GetButton(RightDevice(), CommonUsages.gripButton);
+            ConfirmHeld = ConfirmFrom(TriggerValue(LeftDevice()),
+                                      TriggerValue(RightDevice()));
             SkipHeld = _pressed.Contains("left_a") && _pressed.Contains("right_a");
 
             var key = string.Join(",", _pressed);
@@ -355,6 +365,35 @@ namespace WeGo.Teleop
         {
             if (!_rightDevice.isValid) _rightDevice = InputDevices.GetDeviceAtXRNode(XRNode.RightHand);
             return _rightDevice;
+        }
+
+        /// <summary>Raw trigger pull that counts as confirming, both hands.
+        ///
+        /// The triggers, not the grips, because the grips do not exist as far
+        /// as the host is concerned: they are not in codec.py's BUTTON_NAMES,
+        /// not in its INPUT_FIELDS, and there is no field on the wire that
+        /// could carry them. The host's XRFrame.confirm_gesture is
+        ///
+        ///     (left_hand_pinch and right_hand_pinch)
+        ///       or (left_ctrl_trigger and right_ctrl_trigger)
+        ///
+        /// and nothing else can satisfy it. Build 13 asked the operator for
+        /// the grips and lit its own HOLD CONFIRM bar when they squeezed, so
+        /// the console said the gate was half-passed while the host had never
+        /// seen a confirm at all -- which is also why X + A could not skip:
+        /// the skip path still requires the confirm gesture, and waives only
+        /// the position check.
+        ///
+        /// 0.9 raw is the host's threshold restated. It sends the trigger
+        /// inverted, 10.0 open to 0.0 pressed (see BuildSample), and the host
+        /// tests `value < 1.0`. Both halves are derived from this one constant
+        /// so they cannot drift apart again. Strictly greater, because the
+        /// host's test is strictly less-than.</summary>
+        private const float ConfirmTriggerRaw = 0.9f;
+
+        private static bool ConfirmFrom(float leftRaw, float rightRaw)
+        {
+            return leftRaw > ConfirmTriggerRaw && rightRaw > ConfirmTriggerRaw;
         }
 
         private static bool GetButton(InputDevice device, InputFeatureUsage<bool> usage)
@@ -556,6 +595,8 @@ namespace WeGo.Teleop
             AlignWithinTolerance = align.within_tolerance;
             LeftPosError = align.left_pos_err;
             RightPosError = align.right_pos_err;
+            LeftInPosition = align.left_ok;
+            RightInPosition = align.right_ok;
             HasAlignTargets = true;
         }
 
@@ -579,6 +620,9 @@ namespace WeGo.Teleop
             public string reason;
             public bool within_tolerance;
             public float left_pos_err, right_pos_err;
+            // The host's per-wrist verdict. Rendered as-is; the console does
+            // not re-derive it from the errors above.
+            public bool left_ok, right_ok;
             // Head-relative, robot axes (+x front, +y left, +z up). Null on the
             // wire when the host has no forward kinematics; JsonUtility gives a
             // zero-length array for that, which AlignGuide reads as "no target"

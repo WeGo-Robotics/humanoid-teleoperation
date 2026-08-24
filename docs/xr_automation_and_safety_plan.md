@@ -1229,8 +1229,14 @@ instead of having it in the scene. `TeleopBootstrap`'s header argues for a code-
 `.unity` file, and that argument still holds for *our* objects — but `OVRManager` is not ours, and it expects normal
 scene-load ordering.
 
-**Fix, not yet done:** construct the rig in `QuestBuild.GenerateScene()` so `OVRManager` initialises under scene
-load. That is one change addressing defects 1 and 5 together, and it should land before the next hardware session.
+**Fix, as shipped — and not the one proposed here.** This paragraph originally said to construct the rig in
+`QuestBuild.GenerateScene()` so `OVRManager` initialises under scene load. That is not what was done. `TeleopBootstrap`
+keeps building the rig in code, but has moved it out of `Awake` into a coroutine `Start()` that waits for
+`XRGeneralSettings.Instance.Manager.activeLoader` to come up before touching any of it, with a timeout that builds
+anyway rather than leaving a dead app (`TeleopBootstrap.cs:35-70`). The diagnosis above was right about the cause and
+wrong about the remedy: the problem is not scene load, it is that XR plug-in management has not finished initialising
+when `Awake` runs. Waiting for the loader fixes defect 5, defect 1, and two more that had looked unrelated —
+passthrough never enabling, and `FindHead()` returning null so the HUD anchored at the world origin down by the floor.
 
 A try/catch around `AddComponent<OVRManager>()` was tried and reverted. It let `Awake()` finish, but the app then
 rendered a black screen with no HUD — a worse failure than the one it fixed, and a reminder that a half-initialised
@@ -1256,3 +1262,234 @@ true before defects 1–3 can be measured:
 
 The USB-loopback path was set up and confirmed working this session — `adb reverse` created the device-side
 listener — but §15.2 stopped the app before a single frame was sent.
+
+
+## 16. Build 13 on hardware — 2026-08-24
+
+Three defects, reported from the headset. None of them is in the tracking, the transport or the safety layer; all
+three are in the seam between what the console tells the operator and what the host is actually testing. Two of them
+are regressions in code written to fix the same problem the session before.
+
+First, the work from the afternoon of 2026-08-21 that section 15 predates, because it happened after that section was
+written: the align console rebuilt to the mock, the real G1 from `assets/g1/g1_body29_hand14.urdf` standing on its
+stage, the head camera streamed to the panel, the wireframe body dropped, and the wrist targets drawn as rings in the
+room. Section 15.2's proposed fix was also superseded — see the correction in place above.
+
+### 16.1 The console asked for a gesture the protocol cannot carry
+
+`TeleopHud` said **"hold both grips to confirm"**, and lit its own HOLD CONFIRM bar when the operator squeezed them.
+The host's confirm gesture is
+
+```python
+(left_hand_pinch and right_hand_pinch) or (left_ctrl_trigger and right_ctrl_trigger)
+```
+
+and nothing else can satisfy it. Grip is not in `codec.py`'s `BUTTON_NAMES`, not in its `INPUT_FIELDS`, and there is
+no bit anywhere on the wire that could carry it. **The host never saw a confirm for the whole session.**
+
+That is the whole of the third reported defect, "X + A still cannot skip". The skip path waives the *position* check
+only — `gate_satisfied = operator_confirming and (within or skip_requested)` — so with `operator_confirming` stuck
+false, holding X and A did nothing, correctly. It is also sufficient on its own to explain the first reported defect:
+alignment could never pass, at any pose, at any tolerance.
+
+This is the same shape of fault as the one fixed in commit `39611d7` the session before: *the readout was wrong, not
+the feature*. That fix made the device's skip mirror match the host's test exactly. It did not occur to anyone to
+check the confirm mirror, which was wrong in a worse way — not disagreeing about *when*, but naming a control the
+host has never heard of.
+
+`tools/fake_quest.py` could not have caught it. It has always sent `left_trigger_value = 0.0` for its `confirm`
+scenario, which is correct; the simulator was right and the app was the odd one out. Nothing on the host can catch a
+gesture chosen on the device, which is why the guard for it is now a source-parsing contract test rather than a
+behavioural one.
+
+**Fixed.** `ConfirmHeld` reads both triggers through the same `InputDevice` path as everything else, at a threshold
+(`ConfirmTriggerRaw = 0.9f`) that is the host's `value < 1.0` on the inverted 10.0-open scale restated once, so the
+two cannot drift. Every label says "triggers". `test_contracts.py` now fails if the app confirms on anything the host
+cannot see, if the threshold stops matching, or if the prompt and the binding name different fingers.
+
+Worth knowing, since it was presumably why the grips were picked: the trigger also drives the gripper
+(`LeftPinch = lTrig`). Confirming with the triggers means the robot's hands are commanded closed at the instant
+following begins. Harmless during ALIGN, and it is what the televuer path has always done, but it is a real
+behavioural wart and the argument for putting grip on the wire later.
+
+### 16.2 The mirror fix was dead code
+
+Commit `39611d7` flipped the stage panel horizontally so it reads as a mirror. The flip is correct and it never ran.
+
+```csharp
+if (wanted != null && _stageImage.texture != wanted)
+{
+    _stageImage.texture = wanted;
+    _stageImage.uvRect = camera != null ? new Rect(0,0,1,1) : new Rect(1,0,-1,1);
+}
+```
+
+`BuildStageColumn` already assigns `Stage.Output` at construction time (`TeleopHud.cs:597`), and `TeleopStage` is
+added to the host object before `TeleopHud` so its `Start()` has run and `Output` is non-null by then. On the ALIGN
+path the texture therefore never changes, the branch never runs, and `uvRect` keeps its default. The panel was
+unmirrored for the entire duration of the one state the mirror exists to serve. It would have come good only on the
+way *back* from the head-camera view, which during alignment never happens.
+
+**Fixed** by re-asserting `uvRect` and the caption from the current source every frame instead of on texture change.
+Both setters early-out on an unchanged value, so this costs nothing. The contract test checks the assignment's
+indentation — crude, but it is the same trade this file's test class already makes, and twelve spaces versus sixteen
+is exactly the difference between "runs every frame" and "dead".
+
+### 16.3 The align gate could not be passed by standing correctly
+
+The remaining half of the first defect, and the only one of the three that is a design fault rather than a slip.
+
+At zero joint angles the G1's wrist frame sits at `(0.2498, 0.1487, 0.0952)` in the pelvis frame — forward of the
+pelvis and 9.5cm **above** it, because the URDF's initial pose holds the forearms out in front. The gate compares the
+operator's mapped wrist against that, and the mapping is `target = (op_wrist - op_head) + WAIST_OFFSET` with
+`WAIST_OFFSET = (0.15, 0, 0.45)`. Solving for the operator's half, their hands have to be
+
+    (+0.100 forward, ±0.149 out, −0.355 up)     relative to their own head, reach 0.397 m
+
+35cm below eye level and 10cm in front of the face plane: hands pinned near the chest, elbows drawn well back. Two
+separate things are wrong with asking a member of the public for that. The G1's arm is about 0.32 m shoulder to
+wrist and an adult's is about 0.52 m, so the pose is not the one the operator's body naturally makes when copying the
+robot; and `WAIST_OFFSET_Z = 0.45` is a single constant standing in for every operator's eye-to-waist distance, which
+for a 1.75 m adult is nearer 0.58 m. That 13cm error alone exceeds the entire 10cm tolerance. **Holding the robot's
+initial pose correctly still failed the gate.**
+
+There is no calibration step available. This runs in an experience centre; the operator is a first-time visitor who
+gets a headset put on them. So the requirement is the one the operator stated: *whatever the person's scale, if they
+are holding the robot's initial pose, proceed.*
+
+`AlignConfig.scale_free` (now the default) compares the **direction** of each head-to-wrist vector against the
+direction the robot's FK asks for, and lets the magnitude be whatever that operator's arm happens to be.
+`scale_free=False` restores the absolute-position gate, which is still the right one for a repeatable bench test with
+a known operator, and the original tests now run against it explicitly.
+
+One thing had to be got right for this to be a gate at all. The plain 3D angle between the two vectors is not
+discriminating enough: the reference is dominated by its downward component, so an operator standing with their arms
+hanging straight at their sides scores **15.4°** off the robot's initial pose and walks through a 20° gate. The
+information that says *forearms forward* — the whole character of the pose — lives in the horizontal part, which is
+about a quarter of the vector's length. Comparing elevation and azimuth separately and taking the worse of the two
+gives that part equal weight. The same operator now reads **33.9°** and is refused. Measured against the real URDF
+numbers, at a 20° tolerance:
+
+| operator pose                     | error | verdict |
+|-----------------------------------|-------|---------|
+| initial pose, adult (×1.6 reach)  |  0.0° | pass    |
+| initial pose, child (×0.7 reach)  |  0.0° | pass    |
+| initial pose, sloppy              |  7.3° | pass    |
+| arms hanging at the sides         | 33.9° | refused |
+| hands together in front           | 46.7° | refused |
+| arms straight out forward         | 63.2° | refused |
+| T-pose                            | 63.2° | refused |
+| hands above the head              | 122.3°| refused |
+
+Genuine attempts land at 0–7° and wrong poses at 34° and up, so the threshold sits in a wide empty gap rather than
+being tuned to a hair. The orientation check is unchanged and still blocks — direction alone would pass an operator
+holding the controllers upside down. A hand held at the head, or hanging dead below it with no horizontal component,
+has no measurable direction and reads as out of tolerance, never as a lucky pass.
+
+The rings the headset draws moved with the gate. They are now placed along the required direction **at the operator's
+own current reach**, so the marker is always somewhere that operator's arm can actually go; the guidance stays in
+centimetres, measured to that ring, because telling a first-time visitor to correct by eighteen degrees is not
+useful. The reported position error is the distance to the ring being shown, so the colour, the arrows and the number
+all describe the same thing.
+
+**What did not change: the control mapping.** `WAIST_OFFSET` is still what it was, and the robot still follows the
+operator exactly as before. Only what the gate accepts has changed. That was deliberate — touching the mapping
+changes teleop feel everywhere, and the scale mismatch it papers over is a retargeting question that deserves its own
+session with a robot actually following.
+
+### 16.4 The third place the console was deciding for itself
+
+Found while fixing 16.3, and the same fault as 16.1 one level down. `RenderChecks` ticked the two per-hand rows of
+the checklist by testing the reported error against a `PosTolerance = 0.10f` held privately in `TeleopHud`. That
+number was the absolute gate's tolerance. With the gate now scale-free, the console would have been applying a rule
+the host had stopped applying — ticking hands the host was refusing, or refusing hands it had passed, with the
+disagreement growing the further the operator's build was from the average.
+
+`AlignReport` now carries `left_ok` / `right_ok`, the host's verdict on each wrist including that wrist's
+orientation, and the console renders them. The constant is gone. `TeleopPreviewDriver` keeps a tolerance of its own,
+which is correct — in the preview it *is* the host.
+
+Three defects were reported. All three, plus this one, are the same mistake: the device deciding locally what the
+host means instead of being told. Worth stating plainly, because it is a class and not an incident, and the guards
+added here are per-instance.
+
+### 16.5 A build leak, found by running the build
+
+`PreviewBuild.cs` set `PlayerSettings.productName = "G1 Teleop Preview"` and never put it back. `PlayerSettings` is a
+serialised project asset, so every preview build left `ProjectSettings.asset` dirty — and an APK built from that
+checkout would have shipped named "G1 Teleop Preview", with the rename riding into whatever commit came next looking
+deliberate. Restored now. The first attempt at the fix put the restore in a `finally`, which did not work:
+`EditorApplication.Exit(0)` is called on the success path and terminates the process before any `finally` runs. It is
+restored before that call, with the `finally` kept for the failure and editor-menu paths. The Meta SDK's generated
+`Assets/StreamingAssets/RuntimeActionBindings.json` is now gitignored for the same reason as `Assets/Scenes/`.
+
+### 16.6 The black background was passthrough never coming up
+
+Reported separately, and the reason the experience centre needs it fixed rather than merely tidied: the operator has
+an **instructor standing next to them**, and with a black background they cannot see the person, the robot, or the
+room. Everything this app draws is meant to float over the real world.
+
+Passthrough was already asked for — `isInsightPassthroughEnabled = true`, an `OVRPassthroughLayer` in Underlay mode,
+and `com.oculus.feature.PASSTHROUGH` correctly patched into the manifest by `QuestManifest.cs`. What was wrong is
+that the app decided it had worked without ever asking.
+
+**Passthrough initialisation is asynchronous.** OVRManager's own path returns `Result.Success_Pending` and parks the
+state at `PassthroughInitializationState.Pending`; a later frame moves it to `Initialized`, and it can also land on
+`Failed` (`OVRManager.cs:3660`, SDK 78.0.0). `EnablePassthrough` set the flag, created the layer, and set the camera
+to clear transparent — all in the same frame, before OVRManager's `Update` had run even once for a rig built that
+frame. It then decided the result with
+
+```csharp
+var on = false;
+if (mgr != null) { ...; on = true; }
+head.backgroundColor = on ? new Color(0,0,0,0) : new Color(0.05f,0.06f,0.08f,1f);
+```
+
+`on` means *OVRManager exists*, which is not the question. And a camera clearing to transparent black with nothing
+composited behind it does not render transparent — **it renders black**. So every way passthrough can fail to come
+up produced the same void, and the fallback written for exactly this case could never run, because its condition was
+the wrong one.
+
+Now `TeleopPassthrough`, which asks the SDK what actually happened: it waits for `IsInsightPassthroughInitialized()`,
+bails early and loudly on `HasInsightPassthroughInitFailed()`, times out after 8 s, and only clears to transparent
+once there is genuinely something behind it. Otherwise the camera clears to the dim solid — legible, and obviously a
+fallback rather than a dead display. Each outcome logs which one it was, which is the difference between diagnosing
+this in a minute and losing another session to it.
+
+It also keeps asking. Passthrough is shut down and restarted around app pause and resume, which for this app is
+**every doff and don** (section 10). Deciding once at startup would have put the operator back in the void the first
+time they lifted the headset, so `LateUpdate` tracks the live state and follows it in both directions, creating the
+layer late if passthrough only comes up on a later resume.
+
+The console panel itself is unchanged and still 94% opaque — that was not the complaint, and it sits 29–54° below the
+horizon (section 15's geometry note), so looking straight ahead is the room and looking down is the console.
+
+### 16.7 Verified, and not
+
+Verified on the host: 203 tests pass, up from 182. Twenty-one are new — fifteen covering the scale-free gate against the
+real URDF's forward kinematics at five operator sizes and the per-wrist verdicts, five covering the app/host seam
+these defects went through, and one that the passthrough path cannot go back to assuming it worked. The contract
+tests were checked against build 13's source and fail on it, which is the only evidence that a guard is worth
+having.
+
+Verified on Unity: the app compiles. `tools/build_preview.ps1` produced a Windows player with zero `error CS`,
+which is the whole of what a preview build can tell you about these changes — the mirror, the trigger binding, the
+checklist rows and the passthrough background all need a headset to actually see. Passthrough especially: the
+preview has no OVRManager and never constructs `TeleopPassthrough`, so nothing about section 16.6 is exercised until
+it runs on a Quest.
+
+Not verified: any of it, on a headset. The three fixes here are a source-level diagnosis of three symptoms reported
+from a device, and section 15.3's warning stands unchanged — the button path was recorded as fixed once on the
+strength of a `fake_quest` run and was found dead on hardware. **Defects 1, 2 and 3 from section 14.2 remain
+unmeasured on device**, and so do these. The USB-loopback path from section 15.3 is still the cheapest way to close
+them and is now unblocked: build with `-HostAddress 127.0.0.1`, `adb reverse tcp:8443 tcp:8443`, and run
+`XrLinkServer` standalone.
+
+One thing to know before the next session, unrelated to the three defects and not yet fixed: **the align targets are
+in tracking-space axes, not body axes.** `TeleopSession.LeftAlignTarget` adds the host's offset to the head
+*position* without applying head *yaw* (`TeleopSession.cs:55`), and the host's chain subtracts head translation only
+(`transforms.py`, "world -> head (translation only)"). So "10cm forward" means forward in tracking space, not in
+front of the operator. Turned 90° the rings sit off to their side; turned 180° left and right swap. The stage panel
+does *not* share this — `TeleopStage.LateUpdate` removes the operator's yaw — so the panel and the room disagree
+whenever the operator is not facing the direction they were when tracking was centred. In a lab where the operator
+faces the robot that is invisible. In an experience centre where a visitor turns to look at something, it is not.

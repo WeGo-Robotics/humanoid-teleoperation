@@ -14,7 +14,7 @@
 // panel is the stream's home, and the mirror figure is a placeholder in it.
 //
 // Two things from the mock are prompts here rather than controls: HOLD CONFIRM
-// and HOLD SKIP. They are the grips and A/X. There is no pointer in this app,
+// and HOLD SKIP. They are the triggers and X+A. There is no pointer in this app,
 // so a button you cannot press would be worse than a label that tells you
 // which control to hold -- but they still show their hold progress, because
 // that is the part the operator actually needs.
@@ -74,7 +74,6 @@ namespace WeGo.Teleop
         // the operator needs the room, and by then it is the only thing up.
         private const float MetresPerUnit = 0.00095f;
 
-        private const float PosTolerance = 0.10f;
         private const float HalfFovH = 44f, HalfFovV = 38f;
 
         // ------------------------------------------------------------------
@@ -209,11 +208,11 @@ namespace WeGo.Teleop
             _pillBorder.color = new Color(colour.r, colour.g, colour.b, 0.45f);
 
             _message.text = string.IsNullOrEmpty(Session.AlignReason)
-                ? (aligning ? "hold both grips to confirm" : DefaultMessage(state))
+                ? (aligning ? "hold both triggers to confirm" : DefaultMessage(state))
                 : Session.AlignReason;
 
             _sub.text = aligning
-                ? "Hands inside the targets  ·  both grips to confirm  ·  X + A together to skip"
+                ? "Hands inside the rings  ·  both triggers to confirm  ·  X + A together to skip"
                 : "";
 
             // The camera stream owns the stage only once alignment has
@@ -228,25 +227,34 @@ namespace WeGo.Teleop
             if (wanted != null && _stageImage.texture != wanted)
             {
                 _stageImage.texture = wanted;
-
-                // The model is shown mirrored, the camera is not.
-                //
-                // The stage camera views the robot from the front, so without
-                // this the operator's left hand appears on the right of the
-                // panel and every correction has to be mentally reversed --
-                // which is what made aligning against it so hard. Flipping the
-                // model makes the panel behave like a mirror, where a hand
-                // moved left moves left. The head camera must never be
-                // flipped: it is a view of the world, and mirroring it would
-                // send the operator the wrong way round an obstacle.
-                _stageImage.uvRect = camera != null
-                    ? new Rect(0f, 0f, 1f, 1f)
-                    : new Rect(1f, 0f, -1f, 1f);
-
-                _stageCaption.text = camera != null
-                    ? "head camera · live"
-                    : "mirror view · rings are your wrist targets";
             }
+
+            // The model is shown mirrored, the camera is not.
+            //
+            // The stage camera views the robot from the front, so without this
+            // the operator's left hand appears on the right of the panel and
+            // every correction has to be mentally reversed -- which is what
+            // made aligning against it so hard. Flipping the model makes the
+            // panel behave like a mirror, where a hand moved left moves left.
+            // The head camera must never be flipped: it is a view of the
+            // world, and mirroring it would send the operator the wrong way
+            // round an obstacle.
+            //
+            // Set from the current source every frame, NOT inside the
+            // texture-change branch above. BuildStageColumn already assigns
+            // Stage.Output at construction time, so on the ALIGN path the
+            // texture never changes and that branch never ran -- the flip was
+            // dead code for the whole of the state it exists to serve, and the
+            // panel stayed unmirrored exactly when the operator is trying to
+            // match a pose against it. RawImage.uvRect and Text.text both
+            // early-out on an unchanged value, so re-asserting is free.
+            _stageImage.uvRect = camera != null
+                ? new Rect(0f, 0f, 1f, 1f)
+                : new Rect(1f, 0f, -1f, 1f);
+
+            _stageCaption.text = camera != null
+                ? "head camera · live"
+                : "mirror view · rings are your wrist targets";
 
             var p = Mathf.Clamp01(Session.AlignProgress);
             RenderGauge(aligning ? p : 0f, aligning);
@@ -305,8 +313,10 @@ namespace WeGo.Teleop
         private void RenderChecks(bool aligning)
         {
             var tracked = Session.HeadPosition.sqrMagnitude > 1e-6f;
-            var left = Session.LeftPosError <= PosTolerance;
-            var right = Session.RightPosError <= PosTolerance;
+            // The host's verdict, not a threshold of our own. See
+            // TeleopSession.LeftInPosition.
+            var left = Session.LeftInPosition;
+            var right = Session.RightInPosition;
 
             SetCheck(0, tracked);
             SetCheck(1, Session.HasAlignTargets && InView(Session.LeftAlignTarget));
@@ -666,7 +676,7 @@ namespace WeGo.Teleop
             // Hold prompts.
             var holdsTop = top - barH - 12f;
             _confirmFill = BuildHold(root, new Vector2(StageX, holdsTop),
-                                     "HOLD CONFIRM  (grips)", out _confirmLabel,
+                                     "HOLD CONFIRM  (triggers)", out _confirmLabel,
                                      out _confirmFillRect);
             _skipFill = BuildHold(root, new Vector2(StageX + HoldW + 16f, holdsTop),
                                   "HOLD SKIP  (X + A)", out _skipLabel, out _skipFillRect);

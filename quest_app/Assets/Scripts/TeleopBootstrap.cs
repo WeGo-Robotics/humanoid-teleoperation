@@ -73,7 +73,19 @@ namespace WeGo.Teleop
                 Debug.LogWarning("[Teleop] no centre-eye camera; HUD will anchor to the " +
                                  "scene origin rather than the operator's head.");
 
-            if (Passthrough) EnablePassthrough(head);
+            if (Passthrough)
+            {
+                // Owns the camera's clear mode for the life of the session --
+                // see TeleopPassthrough's header for why this cannot be a
+                // one-shot call made here.
+                var pt = gameObject.AddComponent<TeleopPassthrough>();
+                pt.Head = head;
+            }
+            else if (head != null)
+            {
+                head.clearFlags = CameraClearFlags.SolidColor;
+                head.backgroundColor = new Color(0.05f, 0.06f, 0.08f, 1f);
+            }
 
             // Built on an inactive child, configured, and only then switched
             // on. AddComponent runs OnEnable synchronously, so a component
@@ -167,39 +179,10 @@ namespace WeGo.Teleop
             return Camera.main;
         }
 
-        /// <summary>Underlay passthrough: the camera clears to transparent and
-        /// the passthrough layer renders behind everything Unity draws, so the
-        /// HUD floats over the real room.</summary>
-        private static void EnablePassthrough(Camera head)
-        {
-            // Clearing to transparent is only correct if something is actually
-            // composited behind it. With passthrough off, transparent-black is
-            // just black, and the operator gets an unreadable void with a HUD
-            // floating in it -- which is what this looked like on device before
-            // the rig was deferred past XR init. So the camera setup is
-            // conditional on passthrough really being on, and the fallback is a
-            // dim opaque background that the HUD is at least legible against.
-            var mgr = OVRManager.instance;
-            var on = false;
-            if (mgr != null)
-            {
-                mgr.isInsightPassthroughEnabled = true;
-                var layerGo = new GameObject("PassthroughLayer");
-                var layer = layerGo.AddComponent<OVRPassthroughLayer>();
-                layer.overlayType = OVROverlay.OverlayType.Underlay;
-                on = true;
-            }
-            else
-            {
-                Debug.LogWarning("[Teleop] no OVRManager, so passthrough is off. " +
-                                 "Aligning against a blank background instead of " +
-                                 "the real robot.");
-            }
-
-            if (head == null) return;
-            head.clearFlags = CameraClearFlags.SolidColor;
-            head.backgroundColor = on ? new Color(0f, 0f, 0f, 0f)
-                                      : new Color(0.05f, 0.06f, 0.08f, 1f);
-        }
+        // Passthrough used to be set up here, in one pass, treating "OVRManager
+        // exists" as "passthrough is on". It is not: initialisation is
+        // asynchronous and can fail, and a camera clearing to transparent with
+        // nothing behind it renders black. It lives in TeleopPassthrough now,
+        // which waits for the real state and keeps watching it.
     }
 }

@@ -106,7 +106,7 @@ namespace WeGo.Teleop
 
         private const float DemoApproach = 7f;   // hands drift onto the targets
         private const float DemoSettle = 2.5f;   // in tolerance, not yet held
-        private const float DemoHold = 3.5f;     // grips held, gate closes
+        private const float DemoHold = 3.5f;     // triggers held, gate closes
         private const float DemoFollow = 4f;     // FOLLOWING, then round again
 
         private void RunDemo()
@@ -229,13 +229,18 @@ namespace WeGo.Teleop
             Session.LeftPosError = le;
             Session.RightPosError = re;
 
-            var within = le <= PosTolerance && re <= PosTolerance;
+            // The driver stands in for the host here, so it is the one
+            // entitled to hold a tolerance and decide each hand's verdict --
+            // the console reads the verdict and never re-derives it.
+            Session.LeftInPosition = le <= PosTolerance;
+            Session.RightInPosition = re <= PosTolerance;
+            var within = Session.LeftInPosition && Session.RightInPosition;
             Session.AlignWithinTolerance = within;
 
             var confirming = _manual ? Input.GetKey(KeyCode.Space) : _demoConfirming;
             var skip = _manual && Input.GetKey(KeyCode.Tab);
 
-            // The device reads these off the grips and A/X in PollButtons;
+            // The device reads these off the triggers and X+A in PollButtons;
             // offline that path never runs, so the driver supplies them.
             Session.ConfirmHeld = confirming;
             Session.SkipHeld = _skipLatched;
@@ -270,8 +275,8 @@ namespace WeGo.Teleop
 
         private string Reason(float le, float re, bool within, bool confirming)
         {
-            if (_skipLatched && !confirming) return "position waived — hold both grips to confirm";
-            if (within) return confirming ? "holding…" : "in position — hold both grips to confirm";
+            if (_skipLatched && !confirming) return "position waived — hold both triggers to confirm";
+            if (within) return confirming ? "holding…" : "in position — hold both triggers to confirm";
             var worst = le >= re ? "left" : "right";
             var d = Mathf.Max(le, re);
             return $"move your {worst} hand {d * 100f:F0}cm to its ring";

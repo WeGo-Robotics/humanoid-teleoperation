@@ -45,6 +45,15 @@ namespace WeGo.Teleop.Editor
 
         private static void Run(string output)
         {
+            // PlayerSettings is a serialised project asset, so anything set
+            // here is written to ProjectSettings.asset and stays set. Naming
+            // the product for the preview and then leaving it named that way
+            // meant the next APK built from this checkout would ship as
+            // "G1 Teleop Preview", and the change would ride along in whatever
+            // commit came next as though someone had meant it. Restored on
+            // both paths out of this method -- see the success path below and
+            // the finally, which covers the failure and editor-menu cases.
+            var productName = PlayerSettings.productName;
             try
             {
                 output = Path.GetFullPath(output);
@@ -77,11 +86,21 @@ namespace WeGo.Teleop.Editor
 
                 Log($"OK  {output}  {report.summary.totalSize / (1024 * 1024)} MB  " +
                     $"in {report.summary.totalTime.TotalSeconds:F0}s");
+
+                // Before the exit below, not in the finally: EditorApplication
+                // .Exit terminates the process outright, so a finally after it
+                // never runs. That is why the first attempt at this still left
+                // ProjectSettings.asset dirty.
+                PlayerSettings.productName = productName;
                 if (Application.isBatchMode) EditorApplication.Exit(0);
             }
             catch (Exception e)
             {
                 Fail($"{e.GetType().Name}: {e.Message}\n{e.StackTrace}");
+            }
+            finally
+            {
+                PlayerSettings.productName = productName;
             }
         }
 
