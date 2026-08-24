@@ -32,9 +32,10 @@ namespace WeGo.Teleop
         public Transform HeadAnchor;
 
         [Header("Ring")]
-        [Tooltip("Radius in metres. Matches the gate's 0.10 m position " +
-                 "tolerance so that 'hand inside the ring' means the same " +
-                 "thing the host is actually testing.")]
+        [Tooltip("Fallback radius in metres, used only until the host's first " +
+                 "align report arrives. The real radius comes down the wire " +
+                 "per side, because it is the gate's angular tolerance drawn " +
+                 "at the marker's distance and only the host knows both.")]
         public float RingRadius = 0.10f;
         public int RingSegments = 48;
         public float RingWidth = 0.006f;
@@ -110,8 +111,10 @@ namespace WeGo.Teleop
             }
 
             DrawSide(Session.LeftAlignTarget, Session.LeftWristPosition, Session.LeftPosError,
+                     Session.LeftInPosition, RadiusOr(Session.LeftRingRadius),
                      _leftRing, _leftLead, _leftArrow);
             DrawSide(Session.RightAlignTarget, Session.RightWristPosition, Session.RightPosError,
+                     Session.RightInPosition, RadiusOr(Session.RightRingRadius),
                      _rightRing, _rightLead, _rightArrow);
         }
 
@@ -126,7 +129,15 @@ namespace WeGo.Teleop
         private Quaternion HeadRot => Session != null ? Session.HeadRotation
                                     : (HeadAnchor != null ? HeadAnchor.rotation : Quaternion.identity);
 
+        /// <summary>The host's radius when it has sent one, the inspector
+        /// default until then.</summary>
+        private float RadiusOr(float hostRadius)
+        {
+            return hostRadius > 1e-4f ? hostRadius : RingRadius;
+        }
+
         private void DrawSide(Vector3 target, Vector3 wrist, float hostErr,
+                              bool inPosition, float radius,
                               LineRenderer ring, LineRenderer lead, LineRenderer arrow)
         {
             // Distance is measured locally rather than taken from the host's
@@ -136,7 +147,13 @@ namespace WeGo.Teleop
             // for anything that gates -- this only drives colour.
             var err = Vector3.Distance(wrist, target);
             if (float.IsNaN(err)) err = float.IsNaN(hostErr) ? 0f : hostErr;
-            var colour = ColourFor(err);
+
+            // Green means the HOST says this hand counts, never a threshold of
+            // ours. The gradient below green is local, because "getting
+            // warmer" has to track the hand at frame rate and a colour that
+            // lags by a message feels broken to reach toward -- but the one
+            // colour that means "this is done" is the host's to give.
+            var colour = inPosition ? Good : ColourFor(err, radius);
 
             var visible = IsInView(target);
             ring.enabled = visible;
@@ -144,8 +161,8 @@ namespace WeGo.Teleop
 
             if (visible)
             {
-                DrawRing(ring, target, colour);
-                var far = err > RingRadius;
+                DrawRing(ring, target, colour, radius);
+                var far = err > radius;
                 lead.enabled = far;
                 if (far)
                 {
@@ -162,23 +179,23 @@ namespace WeGo.Teleop
             }
         }
 
-        private Color ColourFor(float err)
+        private Color ColourFor(float err, float radius)
         {
-            if (err <= RingRadius) return Good;
-            var t = Mathf.Clamp01((err - RingRadius) / Mathf.Max(GuidanceRange - RingRadius, 1e-4f));
+            if (err <= radius) return Good;
+            var t = Mathf.Clamp01((err - radius) / Mathf.Max(GuidanceRange - radius, 1e-4f));
             return t < 0.5f ? Color.Lerp(Good, Warn, t * 2f)
                             : Color.Lerp(Warn, Bad, (t - 0.5f) * 2f);
         }
 
         /// <summary>Ring drawn facing the operator, so it reads as a hoop to put
         /// a hand through rather than an ellipse that happens to be edge-on.</summary>
-        private void DrawRing(LineRenderer lr, Vector3 centre, Color colour)
+        private void DrawRing(LineRenderer lr, Vector3 centre, Color colour, float radius)
         {
             var normal = (centre - HeadPos).normalized;
             if (normal.sqrMagnitude < 1e-6f) normal = Vector3.forward;
             var up = Mathf.Abs(Vector3.Dot(normal, Vector3.up)) > 0.95f ? Vector3.forward : Vector3.up;
-            var a = Vector3.Normalize(Vector3.Cross(up, normal)) * RingRadius;
-            var b = Vector3.Normalize(Vector3.Cross(normal, a)) * RingRadius;
+            var a = Vector3.Normalize(Vector3.Cross(up, normal)) * radius;
+            var b = Vector3.Normalize(Vector3.Cross(normal, a)) * radius;
 
             lr.positionCount = RingSegments + 1;
             for (var i = 0; i <= RingSegments; i++)

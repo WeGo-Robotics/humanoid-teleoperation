@@ -234,6 +234,8 @@ namespace WeGo.Teleop
             // the console reads the verdict and never re-derives it.
             Session.LeftInPosition = le <= PosTolerance;
             Session.RightInPosition = re <= PosTolerance;
+            Session.LeftRingRadius = PosTolerance;
+            Session.RightRingRadius = PosTolerance;
             var within = Session.LeftInPosition && Session.RightInPosition;
             Session.AlignWithinTolerance = within;
 

@@ -67,6 +67,17 @@ namespace WeGo.Teleop
         /// what the host means is the defect that cost builds 12 and 13.</summary>
         public bool LeftInPosition, RightInPosition;
 
+        /// <summary>Radius each ring should be drawn at, metres, from the
+        /// host. Zero until a report has arrived, which the guide reads as
+        /// "fall back to your own default" rather than drawing a dot.
+        ///
+        /// This used to be a 0.10f constant on the device, commented as
+        /// matching the gate's position tolerance. The gate has no position
+        /// tolerance any more (docs 16.3), and a ring sized to a rule nobody
+        /// is applying tells the operator to be more precise, or less, than
+        /// they actually need to be.</summary>
+        public float LeftRingRadius, RightRingRadius;
+
         /// <summary>Both triggers held; and X and A held together. Read locally
         /// rather than echoed back from the host, because the checklist has to
         /// respond the instant the operator squeezes and a round trip would
@@ -597,6 +608,8 @@ namespace WeGo.Teleop
             RightPosError = align.right_pos_err;
             LeftInPosition = align.left_ok;
             RightInPosition = align.right_ok;
+            LeftRingRadius = align.left_radius;
+            RightRingRadius = align.right_radius;
             HasAlignTargets = true;
         }
 
@@ -623,6 +636,10 @@ namespace WeGo.Teleop
             // The host's per-wrist verdict. Rendered as-is; the console does
             // not re-derive it from the errors above.
             public bool left_ok, right_ok;
+            // Ring size, metres. The gate's tolerance is an angle, and an
+            // angle has no size until it is put at a distance -- so the host
+            // sends the size along with the place.
+            public float left_radius, right_radius;
             // Head-relative, robot axes (+x front, +y left, +z up). Null on the
             // wire when the host has no forward kinematics; JsonUtility gives a
             // zero-length array for that, which AlignGuide reads as "no target"

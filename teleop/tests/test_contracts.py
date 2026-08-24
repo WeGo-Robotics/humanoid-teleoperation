@@ -299,5 +299,35 @@ class TestQuestAppMatchesTheWireFormat(unittest.TestCase):
                          "the passthrough layer belongs to TeleopPassthrough, "
                          "which knows when it is safe to create one")
 
+    def test_the_ring_size_comes_from_the_host(self):
+        """Both surfaces that draw a wrist target -- the rings in the room and
+
+        the ones on the console's stage -- used to size them with a local
+        0.10f, commented as matching the gate's position tolerance. The gate
+        has no position tolerance now; its tolerance is an angle, and an angle
+        has no size until it is put at a distance. A ring sized to a rule
+        nobody is applying tells the operator to be more precise, or less, than
+        they actually need to be.
+        """
+        for name, field in (("TeleopAlignGuide.cs", "LeftRingRadius"),
+                            ("TeleopStage.cs", "LeftRingRadius")):
+            with self.subTest(name):
+                src = self.source(name)
+                self.assertIn(f"Session.{field}", src,
+                              "the ring size must come down the wire")
+
+    def test_the_ring_turns_green_on_the_hosts_verdict(self):
+        """The gradient below green can be local -- "getting warmer" has to
+
+        track the hand at frame rate. The one colour that means "this hand is
+        done" is the host's to give."""
+        # Named literally per file rather than pattern-matched: the guide
+        # takes the verdict as a parameter and the stage reads it off the
+        # session, so there is no one spelling that covers both.
+        self.assertIn("inPosition ? Good", self.source("TeleopAlignGuide.cs"))
+        stage = self.source("TeleopStage.cs")
+        self.assertIn("Session.LeftInPosition ? Good", stage)
+        self.assertIn("Session.RightInPosition ? Good", stage)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

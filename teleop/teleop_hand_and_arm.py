@@ -570,9 +570,14 @@ if __name__ == '__main__':
                 # including the confirm gesture; this only waives the
                 # position check.
                 skip_requested = frame.left_ctrl_aButton and frame.right_ctrl_aButton
+                # Eye height above the floor -- the tracking origin is
+                # FloorLevel, so this is free and needs nothing of the
+                # operator. It sizes the markers to the person in front of us
+                # and cannot affect the verdict; see AlignGate._operator_scale.
                 report = ALIGN.update(time.monotonic(), robot_l, robot_r,
                                       frame.left_wrist_pose, frame.right_wrist_pose,
-                                      frame.confirm_gesture, skip_requested)
+                                      frame.confirm_gesture, skip_requested,
+                                      head_height_m=float(frame.head_pose[2, 3]))
                 ALIGN_STATE = report.as_dict()
 
                 # Mirror progress into the headset where the transport allows it

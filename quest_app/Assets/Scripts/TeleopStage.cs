@@ -215,14 +215,26 @@ namespace WeGo.Teleop
             _rightRing.enabled = haveTargets;
             if (haveTargets)
             {
-                Ring(_leftRing, Map(Session.LeftAlignTarget), 0.10f,
-                     ColourFor(Session.LeftPosError));
-                Ring(_rightRing, Map(Session.RightAlignTarget), 0.10f,
-                     ColourFor(Session.RightPosError));
+                // Radius and verdict both from the host, same as the rings in
+                // the room: the panel and the room must not disagree about how
+                // big the target is or whether a hand is in it.
+                Ring(_leftRing, Map(Session.LeftAlignTarget),
+                     RadiusOr(Session.LeftRingRadius),
+                     Session.LeftInPosition ? Good : ColourFor(Session.LeftPosError));
+                Ring(_rightRing, Map(Session.RightAlignTarget),
+                     RadiusOr(Session.RightRingRadius),
+                     Session.RightInPosition ? Good : ColourFor(Session.RightPosError));
             }
 
             Ring(_leftHand, Map(Session.LeftWristPosition), 0.045f, Hand);
             Ring(_rightHand, Map(Session.RightWristPosition), 0.045f, Hand);
+        }
+
+        /// <summary>The host's radius once it has sent one. The fallback is
+        /// only ever seen in the frames before the first align report.</summary>
+        private static float RadiusOr(float hostRadius)
+        {
+            return hostRadius > 1e-4f ? hostRadius : 0.10f;
         }
 
         private static Color ColourFor(float err)

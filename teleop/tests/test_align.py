@@ -523,22 +523,154 @@ class TestScaleFreeGate(unittest.TestCase):
         self.assertFalse(np.isfinite(report.left_dir_err))
 
     # -- what the headset is told ---------------------------------------
-    def test_the_ring_is_placed_at_the_operators_own_reach(self):
-        """The marker has to be somewhere this operator's arm can reach, or
+    def test_the_ring_does_not_move_when_the_hand_moves(self):
+        """The first version of this placed the marker at the operator's
 
-        the guidance sends them somewhere they cannot go -- which is how the
-        absolute gate failed in the first place."""
+        *current* reach, which meant reaching toward it pushed it away and it
+        could only ever be caught by rotating. A marker has to be a fixed thing
+        you move toward."""
         cfg = AlignConfig(hold_s=0.2)
-        for scale in (0.7, 1.6):
-            with self.subTest(scale=scale):
-                left, right = self.operator(scale, cfg)
-                report = self.hold(cfg, left, right, seconds=0.04,
-                                   confirming=False)
-                off = np.array([cfg.waist_offset_x, 0.0, cfg.waist_offset_z])
-                op_reach = np.linalg.norm(left[0:3, 3] - off)
-                self.assertAlmostEqual(
-                    float(np.linalg.norm(report.left_target)), op_reach,
-                    places=6)
+        gate = AlignGate(cfg)
+        gate.reset(0.0)
+        seen = []
+        for scale in (0.6, 1.0, 1.4, 1.9):
+            left, right = self.operator(scale, cfg)
+            report = gate.update(0.1, self.G1_L, self.G1_R, left, right, False,
+                                 head_height_m=1.63)
+            seen.append(tuple(report.left_target))
+        for other in seen[1:]:
+            for a, b in zip(seen[0], other):
+                self.assertAlmostEqual(a, b, places=9,
+                                       msg="the ring followed the hand")
+
+    def test_the_ring_is_sized_to_the_operator(self):
+        """A child and a tall adult are not sent to the same point in space.
+
+        Eye height comes free from the FloorLevel tracking origin, so this
+        needs nothing of a first-time visitor -- there is no calibration step
+        to run in an experience centre."""
+        cfg = AlignConfig(hold_s=0.2)
+        left, right = self.operator(1.3, cfg)
+        reach = {}
+        for eye in (1.15, 1.63, 1.78):
+            gate = AlignGate(cfg)
+            gate.reset(0.0)
+            report = gate.update(0.1, self.G1_L, self.G1_R, left, right, False,
+                                 head_height_m=eye)
+            reach[eye] = float(np.linalg.norm(report.left_target))
+        self.assertLess(reach[1.15], reach[1.63])
+        self.assertLess(reach[1.63], reach[1.78])
+
+    def test_the_ring_keeps_the_shape_whatever_the_size(self):
+        """Scaling moves the marker along the required direction and nowhere
+
+        else, so a taller operator gets the same pose further out -- not a
+        different pose."""
+        cfg = AlignConfig(hold_s=0.2)
+        left, right = self.operator(1.3, cfg)
+        off = np.array([cfg.waist_offset_x, 0.0, cfg.waist_offset_z])
+        want = self.G1_L[0:3, 3] - off
+        for eye in (1.15, 1.78):
+            with self.subTest(eye=eye):
+                gate = AlignGate(cfg)
+                gate.reset(0.0)
+                report = gate.update(0.1, self.G1_L, self.G1_R, left, right,
+                                     False, head_height_m=eye)
+                got = np.array(report.left_target)
+                cos = float(np.dot(want, got) /
+                            (np.linalg.norm(want) * np.linalg.norm(got)))
+                self.assertAlmostEqual(cos, 1.0, places=9)
+
+    def test_a_crouch_does_not_shrink_the_markers(self):
+        """Held as a maximum, not sampled once and not averaged: the operator
+
+        is standing when alignment starts, and a nod or a glance at the floor
+        must not pull the rings in underneath them mid-hold."""
+        cfg = AlignConfig(hold_s=0.2)
+        gate = AlignGate(cfg)
+        gate.reset(0.0)
+        left, right = self.operator(1.3, cfg)
+        tall = gate.update(0.1, self.G1_L, self.G1_R, left, right, False,
+                           head_height_m=1.70)
+        stooped = gate.update(0.2, self.G1_L, self.G1_R, left, right, False,
+                              head_height_m=1.20)
+        self.assertEqual(tall.left_target, stooped.left_target)
+
+    def test_a_nonsense_head_height_cannot_move_the_markers(self):
+        cfg = AlignConfig(hold_s=0.2)
+        left, right = self.operator(1.3, cfg)
+        for eye in (0.0, -1.0, 9.0, float("nan"), float("inf")):
+            with self.subTest(eye=eye):
+                gate = AlignGate(cfg)
+                gate.reset(0.0)
+                report = gate.update(0.1, self.G1_L, self.G1_R, left, right,
+                                     False, head_height_m=eye)
+                self.assertEqual(report.operator_scale, 1.0)
+
+    def test_the_operator_scale_stays_inside_its_clamp(self):
+        """Belt and braces. The plausibility window on head height already
+
+        bounds most of this -- 0.9 to 2.2 m against a 1.25 m nominal gives 0.72
+        to 1.76 -- so the clamp only bites at the very bottom. It stays because
+        the two limits are set independently and a change to either should not
+        be able to put a ring somewhere absurd."""
+        cfg = AlignConfig(hold_s=0.2)
+        left, right = self.operator(1.3, cfg)
+        for eye in (0.90, 0.95, 1.10, 1.25, 1.63, 1.90, 2.20):
+            with self.subTest(eye=eye):
+                gate = AlignGate(cfg)
+                gate.reset(0.0)
+                k = gate.update(0.1, self.G1_L, self.G1_R, left, right, False,
+                                head_height_m=eye).operator_scale
+                self.assertGreaterEqual(k, cfg.operator_scale_min)
+                self.assertLessEqual(k, cfg.operator_scale_max)
+        gate = AlignGate(cfg)
+        gate.reset(0.0)
+        self.assertAlmostEqual(
+            gate.update(0.1, self.G1_L, self.G1_R, left, right, False,
+                        head_height_m=0.90).operator_scale,
+            cfg.operator_scale_min, places=6)
+
+    def test_head_height_cannot_change_the_verdict(self):
+        """The whole reason it is safe to guess at the operator's build: the
+
+        estimate sizes the markers and touches nothing that gates. An operator
+        holding the pose passes whatever height the headset reports, and one
+        who is not holding it fails the same way."""
+        cfg = AlignConfig(hold_s=0.2)
+        good_l, good_r = self.operator(1.6, cfg)
+        off = np.array([cfg.waist_offset_x, 0.0, cfg.waist_offset_z])
+        bad_l = pose(*(np.array([0.0, 0.20, -0.65]) + off))
+        bad_r = pose(*(np.array([0.0, -0.20, -0.65]) + off))
+        for eye in (None, 0.95, 1.15, 1.63, 2.15):
+            with self.subTest(eye=eye):
+                gate = AlignGate(cfg)
+                gate.reset(0.0)
+                self.assertTrue(gate.update(0.1, self.G1_L, self.G1_R, good_l,
+                                            good_r, False,
+                                            head_height_m=eye).within_tolerance)
+                gate = AlignGate(cfg)
+                gate.reset(0.0)
+                self.assertFalse(gate.update(0.1, self.G1_L, self.G1_R, bad_l,
+                                             bad_r, False,
+                                             head_height_m=eye).within_tolerance)
+
+    def test_the_ring_radius_is_the_tolerance_at_that_distance(self):
+        """The device used to hold this as a 0.10f constant "matching the
+
+        gate's position tolerance", which the gate no longer has. An angle has
+        no size until it is put at a distance."""
+        cfg = AlignConfig(hold_s=0.2)
+        left, right = self.operator(1.3, cfg)
+        gate = AlignGate(cfg)
+        gate.reset(0.0)
+        report = gate.update(0.1, self.G1_L, self.G1_R, left, right, False,
+                             head_height_m=1.63)
+        d = float(np.linalg.norm(report.left_target))
+        self.assertAlmostEqual(report.left_radius,
+                               d * np.tan(np.radians(cfg.dir_tol_deg)),
+                               places=9)
+        self.assertGreater(report.left_radius, 0.0)
 
     def test_the_ring_keeps_the_direction_the_robot_asked_for(self):
         cfg = AlignConfig(hold_s=0.2)

@@ -1386,11 +1386,10 @@ being tuned to a hair. The orientation check is unchanged and still blocks — d
 holding the controllers upside down. A hand held at the head, or hanging dead below it with no horizontal component,
 has no measurable direction and reads as out of tolerance, never as a lucky pass.
 
-The rings the headset draws moved with the gate. They are now placed along the required direction **at the operator's
-own current reach**, so the marker is always somewhere that operator's arm can actually go; the guidance stays in
-centimetres, measured to that ring, because telling a first-time visitor to correct by eighteen degrees is not
-useful. The reported position error is the distance to the ring being shown, so the colour, the arrows and the number
-all describe the same thing.
+The rings the headset draws moved with the gate — first badly, then properly; see 16.7. The guidance stays in
+centimetres either way, measured to the ring, because telling a first-time visitor to correct by eighteen degrees is
+not useful. The reported position error is the distance to the ring being shown, so the colour, the arrows and the
+number all describe the same thing.
 
 **What did not change: the control mapping.** `WAIST_OFFSET` is still what it was, and the robot still follows the
 operator exactly as before. Only what the gate accepts has changed. That was deliberate — touching the mapping
@@ -1464,17 +1463,69 @@ layer late if passthrough only comes up on a later resume.
 The console panel itself is unchanged and still 94% opaque — that was not the complaint, and it sits 29–54° below the
 horizon (section 15's geometry note), so looking straight ahead is the room and looking down is the console.
 
-### 16.7 Verified, and not
+### 16.7 The rings had to stop following the hand
 
-Verified on the host: 203 tests pass, up from 182. Twenty-one are new — fifteen covering the scale-free gate against the
+The first version of the scale-free marker placed each ring along the required direction **at the operator's own
+current reach**. The reasoning was that a ring at the operator's own arm length is always somewhere they can
+physically get to, which is true and is not enough. The reach was read from where their hand was *at that moment*, so:
+
+* **the marker moved whenever the hand moved.** Reaching toward it pushed it away. It could only ever be caught by
+  rotating the arm, never by extending it — which is a strange thing to hand someone who has been told to put their
+  hands in the rings.
+* **two operators of the same size got different markers**, depending on nothing but how they happened to be standing
+  when alignment began.
+
+A marker has to be a fixed thing you move toward. The distance now comes from the operator's **eye height**, which the
+FloorLevel tracking origin gives for free and which asks nothing of a first-time visitor — there is still no
+calibration step. The required head-relative vector is scaled by `eye_height / 1.25`, that nominal being the eye
+height `WAIST_OFFSET` implicitly assumes: its 0.45 m eye-to-waist is about a third of stature, so the constant encodes
+a person about 1.34 m tall. That is near the G1's own height, which is not a coincidence — the offset was derived from
+the robot, not from a human, and that is the whole of why an adult could never satisfy it.
+
+| operator | scale | ring, head-relative | distance | ring radius |
+|----------|-------|---------------------|----------|-------------|
+| none seen yet | 1.00 | (+0.100, +0.149, −0.355) | 0.40 m | 0.14 m |
+| child, eye 1.15 m | 0.92 | (+0.092, +0.137, −0.326) | 0.37 m | 0.13 m |
+| adult, eye 1.63 m | 1.30 | (+0.130, +0.194, −0.463) | 0.52 m | 0.19 m |
+| tall, eye 1.78 m | 1.42 | (+0.142, +0.212, −0.505) | 0.57 m | 0.21 m |
+
+For the adult that is hands about 46 cm below the eyes and 13 cm forward — navel height, forearms out. A natural ready
+stance, which is what the G1's initial pose *is* once it is expressed at human scale.
+
+Held as a **maximum** over the align, not sampled once and not averaged: the operator is standing when alignment
+begins, and a nod, a crouch or a glance down at the console must not pull the rings in underneath them mid-hold.
+Implausible readings (outside 0.9–2.2 m, or non-finite) are ignored entirely, and the resulting ratio is clamped on
+top of that.
+
+**The estimate cannot change the verdict, and that is the point.** It sizes markers and nothing else. Being 10% out
+about someone's build moves a ring a few centimetres; the same error feeding the gate would refuse an operator who was
+standing correctly, which is precisely the failure this whole section exists to undo. There is a test that asserts it:
+the same pose passes and the same wrong pose fails at every head height, including none.
+
+The ring's **size** came down with it. Both surfaces that draw a wrist target — the rings in the room and the ones on
+the console's stage — sized them with a local `0.10f`, commented as matching the gate's position tolerance. The gate
+has no position tolerance now; its tolerance is an angle, and an angle has no size until it is put at a distance. The
+host sends the radius per side, and the console renders it. It is approximate in the forgiving direction: the
+acceptance region is a box in elevation and azimuth rather than a cone, so a hand just outside the ring can still
+pass. The ring says roughly where and roughly how close; whether that hand counts is `left_ok`, which is the host's
+answer — and it is now the only thing that turns a ring green. The gradient below green stays local, because "getting
+warmer" has to track the hand at frame rate.
+
+That makes three device-side constants removed in this section that were each mirroring a host rule: the confirm
+binding, the checklist tolerance, and the ring radius. Same class as 16.4.
+
+### 16.8 Verified, and not
+
+Verified on the host: 212 tests pass, up from 182. Thirty are new — fifteen covering the scale-free gate against the
 real URDF's forward kinematics at five operator sizes and the per-wrist verdicts, five covering the app/host seam
-these defects went through, and one that the passthrough path cannot go back to assuming it worked. The contract
-tests were checked against build 13's source and fail on it, which is the only evidence that a guard is worth
-having.
+these defects went through, one that the passthrough path cannot go back to assuming it worked, and eight on the
+marker placement of 16.7 — including the one that matters most, that no head height the headset can report changes
+whether the gate passes. The contract tests were checked against build 13's source and fail on it, which is the only
+evidence that a guard is worth having.
 
 Verified on Unity: the app compiles. `tools/build_preview.ps1` produced a Windows player with zero `error CS`,
 which is the whole of what a preview build can tell you about these changes — the mirror, the trigger binding, the
-checklist rows and the passthrough background all need a headset to actually see. Passthrough especially: the
+checklist rows, the ring placement and the passthrough background all need a headset to actually see. Passthrough especially: the
 preview has no OVRManager and never constructs `TeleopPassthrough`, so nothing about section 16.6 is exercised until
 it runs on a Quest.
 

@@ -57,10 +57,17 @@ operator's scale, if they are holding the robot's initial pose, proceed.*
 head-to-wrist vector against the direction the robot's own FK asks for -- as
 elevation and azimuth, separately, so that "forearms forward" counts for as
 much as "hands low"; see `_direction_error_deg` -- and lets the magnitude be
-whatever that operator's arm is. Both
-markers are placed at the operator's own current reach along the required
-direction, so the ring is always somewhere their arm can actually go and the
-only thing left to correct is which way they are pointing. Set
+whatever that operator's arm is.
+
+The markers are a separate question from the gate, and are sized from the
+operator's eye height -- free to read, since the tracking origin is FloorLevel,
+and requiring nothing of a first-time visitor. A marker derived from where the
+hand *currently* is would move whenever the hand moved; these depend only on
+the robot's pose and the operator's height, so they hold still, and they sit in
+a different place for a tall adult than for a child. Nothing about that
+estimate can change whether the gate passes, which is what makes it safe to
+guess at: being 10% out moves a ring a few centimetres, where the same error
+feeding the gate would refuse someone who was standing correctly. Set
 `scale_free=False` for the original absolute-position gate, which is still the
 right one for a repeatable bench test with a known operator.
 
@@ -92,6 +99,16 @@ class AlignConfig:
     #: vector is too short to carry a bearing -- a hand hanging dead below the
     #: head. Reported as unmeasurable, which the gate treats as a refusal.
     min_horizontal_frac: float = 0.10
+    #: The operator's eye height that WAIST_OFFSET implicitly assumes. Its
+    #: 0.45 m eye-to-waist is about a third of stature, so the constant encodes
+    #: a person roughly 1.34 m tall -- near the G1's own height, which is not a
+    #: coincidence: the offset was derived from the robot, not from a human.
+    #: Used only to size the markers, never to gate; see `_operator_scale`.
+    nominal_eye_height_m: float = 1.25
+    #: Clamp on that ratio. A headset reporting nonsense, or an operator who
+    #: crouches or sits, must not be able to fling the rings somewhere absurd.
+    operator_scale_min: float = 0.75
+    operator_scale_max: float = 1.80
     hold_s: float = 2.0            # continuous agreement before accepting
     timeout_s: float = 120.0       # give up and return to idle
     guidance_range_m: float = 0.75  # informational only: distance at which the
@@ -131,6 +148,16 @@ class AlignReport:
     #: of defect that cost builds 12 and 13 (docs sections 15.2, 16.1).
     left_ok: bool = False
     right_ok: bool = False
+    #: Radius the headset should draw each ring at, metres. The gate's
+    #: tolerance is an angle, and an angle has no size until it is put at a
+    #: distance; this is that angle at the marker's distance. Sent rather than
+    #: held on the device, which used to mirror the old 0.10 m position
+    #: tolerance in a constant of its own.
+    left_radius: float = 0.0
+    right_radius: float = 0.0
+    #: The operator's size relative to the one WAIST_OFFSET assumes. 1.0 when
+    #: no head height has been seen yet.
+    operator_scale: float = 1.0
     reason: str = ""
     #: Where the operator's wrists have to be, expressed the same way the
     #: device expresses them: relative to the operator's own head, in robot
@@ -176,6 +203,9 @@ class AlignReport:
             "right_dir_err": clean(self.right_dir_err),
             "left_ok": self.left_ok,
             "right_ok": self.right_ok,
+            "left_radius": round(float(self.left_radius), 4),
+            "right_radius": round(float(self.right_radius), 4),
+            "operator_scale": round(float(self.operator_scale), 3),
             "reason": self.reason,
             # Sent as plain lists so JsonUtility on the device can deserialise
             # them without a custom converter; omitted entirely when FK is
@@ -213,6 +243,12 @@ class AlignGate:
                            float("inf"), float("inf"), float("inf"))
         self._last_targets = (None, None)
         self._last_sides = (False, False)
+        self._last_radii = (0.0, 0.0)
+        #: Tallest plausible eye height seen since this align began. Held, and
+        #: taken as a maximum rather than sampled once or averaged: the
+        #: operator is standing when alignment starts, and a nod, a crouch or
+        #: a glance at the floor must not shrink the markers underneath them.
+        self._eye_height: Optional[float] = None
 
     @property
     def accepted(self) -> bool:
@@ -222,7 +258,8 @@ class AlignGate:
                robot_left: Optional[np.ndarray], robot_right: Optional[np.ndarray],
                operator_left: np.ndarray, operator_right: np.ndarray,
                operator_confirming: bool,
-               skip_requested: bool = False) -> AlignReport:
+               skip_requested: bool = False,
+               head_height_m: Optional[float] = None) -> AlignReport:
         """One evaluation cycle.
 
         `robot_left` / `robot_right` come from FK of the current arm joints.
@@ -234,7 +271,20 @@ class AlignGate:
         for the confirm gesture, and it is re-read every cycle like everything
         else that feeds this hold -- letting go of either resets it the same
         way.
+
+        `head_height_m` is the operator's eye height above the floor, which the
+        tracking origin being FloorLevel makes free to read. It sizes the
+        markers to the person and nothing else -- **it cannot affect whether
+        the gate passes.** That separation is the point: an anthropometric
+        guess that is 10% out moves a ring by a few centimetres, where the same
+        guess feeding the gate would refuse an operator who was standing
+        correctly.
         """
+        if head_height_m is not None and np.isfinite(head_height_m) \
+                and 0.9 <= float(head_height_m) <= 2.2:
+            h = float(head_height_m)
+            self._eye_height = h if self._eye_height is None \
+                else max(self._eye_height, h)
         if self._accepted:
             lp, rp, lr, rr, ld, rd = self._last_errs
             return self._report(self._last_within, True, True, False,
@@ -273,8 +323,8 @@ class AlignGate:
                 # direction. Placing it at the robot's own distance is what
                 # made the gate unsatisfiable for anyone whose arm is not the
                 # length the waist offset assumes.
-                left_target = self._scaled_target(op_l, ref_l)
-                right_target = self._scaled_target(op_r, ref_r)
+                left_target = self._scaled_target(ref_l)
+                right_target = self._scaled_target(ref_r)
                 # Reported against the ring the operator is actually being
                 # shown, so the HUD's colour, the guidance arrows and the
                 # number all describe the same thing.
@@ -300,6 +350,9 @@ class AlignGate:
         self._last_within, self._last_errs = within, (lp, rp, lr, rr, ld, rd)
         self._last_targets = (left_target, right_target)
         self._last_sides = (left_ok, right_ok)
+        self._last_radii = (
+            0.0 if left_target is None else self._ring_radius(left_target),
+            0.0 if right_target is None else self._ring_radius(right_target))
 
         # Both agreements must hold *continuously*; either lapsing restarts the
         # countdown. Sampling once at the end would let the operator drift out
@@ -400,22 +453,63 @@ class AlignGate:
 
         return max(el_err, az_err)
 
-    def _scaled_target(self, op_vec: np.ndarray,
-                       ref_vec: np.ndarray) -> Tuple[float, float, float]:
-        """The required direction, at the operator's own current reach.
+    def _operator_scale(self) -> float:
+        """How big this operator is, relative to the one WAIST_OFFSET assumes.
 
-        Falls back to the robot's own distance while the hand is too close to
-        the head to have a reach worth quoting -- the ring has to be somewhere,
-        and the robot's distance is the only other defensible answer.
+        Read from eye height, which the FloorLevel tracking origin gives for
+        free and which needs nothing from the operator -- there is no
+        calibration step to run in an experience centre, and a first-time
+        visitor will not perform one. Clamped, because a headset reporting
+        nonsense, or an operator who sits down, must not be able to move the
+        markers somewhere absurd.
+
+        Sizing only. Nothing downstream of this can change the gate's verdict.
         """
-        n_ref = float(np.linalg.norm(ref_vec))
-        if n_ref < 1e-6:
-            return (float(ref_vec[0]), float(ref_vec[1]), float(ref_vec[2]))
-        reach = float(np.linalg.norm(op_vec))
-        if reach < self.cfg.min_reach_m:
-            reach = n_ref
-        unit = ref_vec / n_ref
-        return (float(unit[0] * reach), float(unit[1] * reach), float(unit[2] * reach))
+        if self._eye_height is None:
+            return 1.0
+        k = self._eye_height / max(self.cfg.nominal_eye_height_m, 1e-6)
+        return float(np.clip(k, self.cfg.operator_scale_min,
+                             self.cfg.operator_scale_max))
+
+    def _scaled_target(self, ref_vec: np.ndarray) -> Tuple[float, float, float]:
+        """Where to put this operator's marker: the required pose, scaled to
+
+        their body.
+
+        The first version of this placed the ring at the operator's *current*
+        reach along the required direction. That was wrong in a way that is
+        obvious the moment a person is wearing it: the marker is derived from
+        where their hand is, so it moves whenever their hand moves. Reaching
+        toward it pushes it away, and it can only ever be caught by rotating,
+        never by reaching. It also meant two operators of the same size got
+        different markers depending on how they happened to be standing when
+        alignment began.
+
+        A marker has to be a fixed thing you move toward. This one depends only
+        on the robot's pose and the operator's height, so it is stationary for
+        the whole of the align, and it is in a different place for a tall adult
+        than for a child -- which is the entire point.
+        """
+        k = self._operator_scale()
+        v = np.asarray(ref_vec, dtype=float) * k
+        return (float(v[0]), float(v[1]), float(v[2]))
+
+    def _ring_radius(self, target: Tuple[float, float, float]) -> float:
+        """The gate's angular tolerance, drawn at the marker's distance.
+
+        The device used to hold this as a 0.10 m constant "matching the gate's
+        position tolerance", which the gate no longer has. An angle has no size
+        until you put it at a distance, so the size belongs here, with the
+        angle.
+
+        Approximate on purpose, and in the forgiving direction: the acceptance
+        region is a box in elevation and azimuth, not a cone, so a hand just
+        outside the ring can still pass. The ring says roughly where and
+        roughly how close; whether that hand actually counts is `left_ok`,
+        which is the host's answer and the one the console colours from.
+        """
+        d = float(np.linalg.norm(np.asarray(target, dtype=float)))
+        return float(d * np.tan(np.radians(self.cfg.dir_tol_deg)))
 
     def _head_relative_target(self, robot_wrist: np.ndarray) -> Tuple[float, float, float]:
         """Undo the waist offset so the device can place a marker.
@@ -508,11 +602,14 @@ class AlignGate:
         # blink out because the gate took a different branch.
         lt, rt = self._last_targets
         lok, rok = self._last_sides
+        lrad, rrad = self._last_radii
         return AlignReport(
             within_tolerance=within, operator_confirming=confirming,
             accepted=accepted, timed_out=timed_out, held_s=held,
             progress=progress, left_pos_err=lp, right_pos_err=rp,
             left_rot_err=lr, right_rot_err=rr,
             left_dir_err=ld, right_dir_err=rd,
-            left_ok=lok, right_ok=rok, reason=reason,
+            left_ok=lok, right_ok=rok,
+            left_radius=lrad, right_radius=rrad,
+            operator_scale=self._operator_scale(), reason=reason,
             left_target=lt, right_target=rt)
