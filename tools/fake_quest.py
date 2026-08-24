@@ -49,6 +49,12 @@ SCENARIOS = {
     "untracked": "Report both hands untracked while still streaming.",
     "estop": "Stream, then send an estop control message.",
     "confirm": "Stream with the confirm gesture held, for the align gate.",
+    "align-skip": "Stream with the confirm gesture AND both face buttons held, "
+                  "which is the operator waiving the position check. Should "
+                  "reach 'accepted' after AlignConfig.hold_s. This is the exact "
+                  "path that was dead in build 13 (docs §16.1) -- the app asked "
+                  "for the grips, which the host cannot see, so the skip could "
+                  "never engage.",
     "buttons": "Stream, then hold both thumbstick clicks (damp), release, "
                "then press right A (quit). Exercises the control-channel "
                "button path -- only visible with --motion on the host.",
@@ -172,6 +178,17 @@ class FakeQuest:
             print("[fake-quest] >>> sending estop")
             await ws.send(json.dumps({"t": "estop"}))
             await self._stream(ws, duration, "post-estop")
+
+        elif scenario == "align-skip":
+            # Both together, level-triggered, held continuously: the host tests
+            # `left_ctrl_aButton and right_ctrl_aButton` fresh every cycle and
+            # the confirm gesture alongside it, and lets go of either resets
+            # the hold. --confirm is implied; without it this proves nothing,
+            # because skip waives the position check and never the gesture.
+            self.confirm = True
+            await self._buttons(ws, ["left_a", "right_a"], "skip held")
+            await self._stream(ws, duration, "skip+confirm")
+            await self._buttons(ws, [], "release")
 
         elif scenario == "buttons":
             # Level-triggered, exactly as the app sends it: each message is the

@@ -350,5 +350,33 @@ class TestButtons(LinkFixture):
         self.assertFalse(frame.liveness.left_tracked)
 
 
+class TestBindFailureIsReported(unittest.TestCase):
+    """start() used to return True when the listen failed.
+
+    The server thread sets its ready event on the failure path as well as the
+    success path, so waiting on that alone said "running" for a server that had
+    never bound. The commonest cause is the port already being held -- another
+    host still up, or a previous one not yet torn down -- and the symptom was a
+    host sitting there waiting for a device that could never arrive, which
+    reads as a headset problem and is not. Found while setting up the XR
+    Simulator host, where two hosts on one machine is the normal way to trip
+    it.
+    """
+
+    def test_second_server_on_the_same_port_fails_to_start(self):
+        first = XrLinkServer(host="127.0.0.1", port=0)
+        self.assertTrue(first.start())
+        try:
+            second = XrLinkServer(host="127.0.0.1", port=first.port)
+            try:
+                self.assertFalse(
+                    second.start(timeout=3.0),
+                    "a server that could not bind reported success")
+            finally:
+                second.stop()
+        finally:
+            first.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

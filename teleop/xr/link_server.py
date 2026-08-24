@@ -76,6 +76,10 @@ class XrLinkServer:
         self._server = None
         self._client = None
         self._ready = threading.Event()
+        #: Set by the server thread when websockets.serve raised. start() has
+        #: to check it: the thread signals _ready on the failure path too, so
+        #: waiting on that alone reports a server that never bound as running.
+        self._serve_error: Optional[BaseException] = None
         self._running = False
 
         # Head-camera video. Counters are plain ints touched only from the
@@ -103,6 +107,17 @@ class XrLinkServer:
         self._thread.start()
         if not self._ready.wait(timeout):
             logger_mp.error("[XrLink] server failed to start within %.1fs", timeout)
+            self._running = False
+            return False
+        if self._serve_error is not None:
+            # The commonest cause is the port already being held -- another
+            # host still running, or a previous one not yet torn down. Reported
+            # as a failure rather than swallowed, because a caller that thinks
+            # it has a server will sit and wait for a device that can never
+            # arrive, which looks like a headset problem and is not.
+            logger_mp.error(f"[XrLink] could not listen on {self._host}:"
+                            f"{self._port}: {self._serve_error!r}")
+            self._running = False
             return False
         return True
 
@@ -114,7 +129,8 @@ class XrLinkServer:
             loop.run_until_complete(self._serve())
         except Exception as e:
             logger_mp.error(f"[XrLink] server loop failed: {e!r}")
-            self._ready.set()      # unblock start(), which will report failure
+            self._serve_error = e
+            self._ready.set()      # unblock start(), which now reports failure
         finally:
             try:
                 loop.run_until_complete(loop.shutdown_asyncgens())

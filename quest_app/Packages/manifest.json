@@ -10,7 +10,9 @@
   ],
   "dependencies": {
     "com.meta.xr.sdk.core": "78.0.0",
+    "com.meta.xr.simulator": "78.0.0",
     "com.unity.xr.oculus": "4.5.1",
+    "com.unity.test-framework": "1.1.33",
     "com.unity.ugui": "1.0.0",
     "com.unity.modules.ai": "1.0.0",
     "com.unity.modules.androidjni": "1.0.0",
