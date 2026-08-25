@@ -1256,3 +1256,87 @@ true before defects 1–3 can be measured:
 
 The USB-loopback path was set up and confirmed working this session — `adb reverse` created the device-side
 listener — but §15.2 stopped the app before a single frame was sent.
+
+---
+
+## 16. Device telemetry — recorded, not reconstructed
+
+Every app-side defect in §14.2 and §15.2 was found the same way: after the session was already lost, by writing a
+one-off probe and running the whole bring-up again. §14.3's measurement — 978 frames, head spread 0.000 m,
+controllers 0.2 m — is the shape of the answer, and it took three wrong diagnoses to get to it.
+
+`teleop/xr/link_recorder.py` makes that probe permanent. The link server now takes an optional recorder that
+observes the wire and writes JSONL. It never feeds the snapshot, so a recorder that stalls degrades the evidence
+and nothing else.
+
+### 16.1 What it writes
+
+One self-describing object per line, three kinds:
+
+| `rec` | when | carries |
+|---|---|---|
+| `event` | connect, `hello`, presence, buttons, estop, decode error, disconnect | the fact and its fields |
+| `frame` | decimated, 10 Hz of the device's ~72 | head/wrist position + quaternion, tracked flags, `worn`, inputs, and `left_rel_head` / `right_rel_head` |
+| `summary` | every 5 s, and on disconnect | the window's diagnostics, plus named findings |
+
+Poses are logged **raw OpenXR**, before `transforms.openxr_to_robot`. A device bug shows up in the device's frame;
+running the host transform first would fold host bugs into the same numbers.
+
+`left_rel_head` is on every frame record because that is the chain the safety layer consumes. Defect 1 hid precisely
+because the head and the wrists each looked plausible alone — only the subtraction was wrong.
+
+Diagnostics are computed over **every** frame even though pose rows are sampled: a 10 Hz record of a 72 Hz link
+still reports 72 fps, and still counts all 72 toward the spreads.
+
+### 16.2 The findings it names
+
+Each maps to a defect this project has already paid for once:
+
+| finding | measurement | defect |
+|---|---|---|
+| `head_pose_identity` | head is I(4) in >99 % of frames | §14.2 (1) |
+| `head_pose_static` | head spread < 1 mm, but not identity | same failure, different value |
+| `head_static_while_wrists_move` | head < 1 mm while a wrist ≥ 1 mm | §14.3's measurement, automated |
+| `left_untracked_while_moving` | tracked flag < 1 %, poses moving | §14.2 (2) |
+| `no_button_messages` | frames arrived, zero button messages | §14.2 (3) |
+| `decode_errors` | frames failed to decode | protocol mismatch |
+
+`no_button_messages` is only evidence because a press *would* have been recorded — the recorder logs every control
+message, not just the ones that change state.
+
+### 16.3 Running it
+
+The dashboard passes `--xr-log` on every launch, to `teleop/logs/xrlink-<timestamp>.jsonl`. A session that is not
+recorded is a session that has to be run again.
+
+```bash
+# explicit path, every frame instead of 10 Hz
+python teleop_hand_and_arm.py --xr-source xrlink --xr-log /tmp/quest.jsonl --xr-log-hz 0
+
+# fold a recording into one verdict
+python -m teleop.xr.link_recorder /tmp/quest.jsonl
+python -m teleop.xr.link_recorder /tmp/quest.jsonl --json   # for a program
+```
+
+The digest ends in a one-line verdict and, for each finding, the note explaining what it means — so a reader who has
+not read this document still learns which numbers mattered.
+
+The recorder depends only on `numpy`, so it runs in the bare `websockets` + `numpy` probe environment of §15.3.
+That is the environment the USB-loopback bring-up uses, which is where defects 1–3 will actually be measured.
+
+### 16.4 Verified
+
+Unit tests in `teleop/tests/test_link_recorder.py` synthesise each defect and assert the finding. End-to-end against
+a real `XrLinkServer` over a real websocket, with a client sending identity heads, moving wrists and false tracked
+flags, the digest reported:
+
+```
+verdict : device telemetry is defective: head_pose_identity, left_untracked_while_moving,
+          right_untracked_while_moving, head_static_while_wrists_move, no_button_messages
+frames  : 60  fps 69.0  gap_max_ms 14.5
+head    : [0.0, 0.0, 0.0]  identity% 100.0
+wrists  : [0.17, 0.0, 0.0] [0.17, 0.0, 0.0]
+tracked : 0.0 0.0
+```
+
+Not verified: any of this against a real Quest 3. The blocker is still §15.3's topology, unchanged.

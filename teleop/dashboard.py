@@ -25,6 +25,41 @@ import os
 import signal
 os.environ.setdefault("MUJOCO_GL", "egl")  # headless offscreen GL
 
+PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent():
+    """Ask the kernel to SIGTERM this process when its parent dies.
+
+    The last line of defence against orphans. Every softer mechanism --
+    closeEvent, the SIGTERM handler, the respawn supervisor -- needs the
+    dashboard to still be running to do its job, so none of them survive
+    `kill -9` on the dashboard. This does, because it is the kernel that
+    delivers it. The teleop child turns that SIGTERM into its normal safe
+    shutdown, so the arms still go home on the way out.
+
+    Used two ways: as Popen's `preexec_fn` for the teleop child, and as a
+    register_at_fork hook for everything else that forks. Failure here must
+    never stop a launch, so it is deliberately swallowed.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+# Installed before every other import, deliberately. The teleop child is not the
+# only child: logging_mp forks a listener process when it is imported, which
+# happens further down this file via teleop.utils.ipc. PR_SET_PDEATHSIG is
+# cleared across fork, so that listener outlived a `kill -9` on the dashboard and
+# sat there reparented to init. Registering the hook after those imports was too
+# late to catch it -- the fork had already happened.
+try:
+    os.register_at_fork(after_in_child=_die_with_parent)
+except AttributeError:      # Python < 3.7
+    pass
+
 import sys
 import time
 import json
@@ -76,6 +111,22 @@ C = {
 
 def now_str():
     return datetime.now().strftime("%H:%M:%S")
+
+
+# The teleop child needs the `vtv` conda env (pinocchio, unitree_sdk2py, ...);
+# the dashboard itself needs far less and will happily start under the system
+# python3. Launching the child with plain sys.executable made that mismatch
+# silent: the child died on `ModuleNotFoundError: No module named 'pinocchio'`
+# within a second, one line in the log box, and the XrLink server never came up
+# -- which reads to the operator as "the headset won't connect".
+TELEOP_ENV_PYTHON = "/home/wego/miniconda3/envs/vtv/bin/python"
+
+
+def _teleop_python():
+    """Interpreter for the teleop subprocess: the env that has its deps."""
+    if os.path.exists(TELEOP_ENV_PYTHON):
+        return TELEOP_ENV_PYTHON
+    return sys.executable
 
 
 def list_net_ifaces():
@@ -908,6 +959,22 @@ class Dashboard(QWidget):
         self.ipc = None                # set below; _build_ui may query it early
         self.proc = None
         self._stop_deadline = None   # time by which the proc group must exit after CMD_STOP
+        self._kill_deadline = None   # time by which it must be gone after the SIGTERM escalation
+        # --- teleop supervision -------------------------------------------
+        # The XrLink websocket server that the headset connects to lives inside
+        # the teleop process, so every teleop exit -- 비상 정지, a crash, a signal
+        # -- drops the headset's link. Respawning keeps the device connected for as
+        # long as this window is open; the operator should not have to re-pair
+        # from inside the headset after every session.
+        self._supervise = True       # cleared on window close so we stop respawning
+        self._respawn_timer = None   # pending QTimer for the next respawn
+        self._term_requested = False # set by the SIGTERM/SIGINT/SIGHUP handler
+        self._respawn_backoff = 0.0  # grows while the child keeps dying young
+        self._launch_time = 0.0      # monotonic time of the last spawn
+        # A respawn starts a process whose SafetyFSM has never seen the e-stop,
+        # so the latch has to live out here to survive it. Cleared only by
+        # [안전정지 해제].
+        self._estop_latched = False
         self.mode_checker = MotionModeChecker()   # robot walking-mode probe (real robot)
         self._log_signal.connect(self._log)
 
@@ -923,6 +990,19 @@ class Dashboard(QWidget):
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_xr)
         self._ui_timer.start(250)
+
+        # SIGTERM/SIGINT/SIGHUP -> the same teardown as closing the window.
+        # Qt's event loop sits in C code, so a Python signal handler does not run
+        # until the interpreter gets control back; the handler therefore only
+        # sets a flag and this timer -- which is already ticking -- acts on it.
+        # Without this, `pkill dashboard.py` or a Ctrl-C in the launching shell
+        # killed the dashboard outright and left the teleop child running: an
+        # orphan still holding port 8443, so the next dashboard's own child could
+        # not bind it.
+        self._sig_timer = QTimer(self)
+        self._sig_timer.timeout.connect(self._check_term)
+        self._sig_timer.start(200)
+        self._install_signal_handlers()
 
         # --- data sources ---
         self.state_src = LowStateSource()
@@ -953,6 +1033,14 @@ class Dashboard(QWidget):
         self._hb_timer.start(100)
 
         self._log("대시보드 준비 완료" + ("" if self.ipc else " (IPC 미연결)"))
+
+        # Launch the teleop subprocess as soon as the window is up, instead of
+        # waiting on a manual 실행 click. Deferred via singleShot(0, ...) rather
+        # than called directly here: _on_launch can pop a modal safety dialog
+        # (real-robot walk-mode / debug-mode warning), which needs the main
+        # window to already be shown, and show() has not run yet at this point
+        # in __init__.
+        QTimer.singleShot(0, self._on_launch)
 
     # --- ui -----------------------------------------------------------------
     def _build_ui(self):
@@ -1312,7 +1400,9 @@ class Dashboard(QWidget):
             for val in self.xr_rows.values():
                 val.setText("—")
             self.xr_reason.setVisible(False)
-            self.btn_ack.setEnabled(False)
+            # stays clickable with no heartbeat: after 비상 정지 the teleop process
+            # is exiting/respawning, and the latch to clear is the local one.
+            self.btn_ack.setEnabled(self._estop_latched)
             self._set_xr_tag(None)
             self._apply_button_state()
             return
@@ -1331,9 +1421,11 @@ class Dashboard(QWidget):
         reason = xr.get("reason") or ""
         self.xr_reason.setText(reason)
         self.xr_reason.setVisible(bool(reason))
-        self.btn_ack.setEnabled(latched)
+        self.btn_ack.setEnabled(latched or self._estop_latched)
 
-        if latched:
+        if self._estop_latched:
+            self._set_xr_tag(False, "비상 정지")
+        elif latched:
             self._set_xr_tag(False, "안전 정지")
         elif not link_up:
             self._set_xr_tag(False, "링크 끊김")
@@ -1347,6 +1439,11 @@ class Dashboard(QWidget):
 
     def _xr_block_reason(self):
         """Why 시작 is unavailable, or None if it is fine to start."""
+        # Checked before the heartbeat: an e-stop survives the respawn that
+        # follows it, so it must still block 시작 while the new process is
+        # starting up and no heartbeat has arrived yet.
+        if self._estop_latched:
+            return "비상 정지됨 — [안전정지 해제] 후 시작"
         if not self._hb_fresh():
             return "텔레옵 상태 수신 없음"
         xr = self._xr
@@ -1395,14 +1492,46 @@ class Dashboard(QWidget):
         self._log(f"[IPC] CMD_CANCEL_ALIGN -> {'ok' if ok else msg}")
 
     def _on_ack(self):
-        ok, msg = self._send_cmd("CMD_ACK_FAULT")
-        self._log(f"[IPC] CMD_ACK_FAULT -> {'ok' if ok else msg}")
+        # Clears both latches: the teleop-side SafetyFSM one (if that process is
+        # still the one that latched) and the dashboard-side e-stop one, which is
+        # the only record left after a respawn.
+        was_estop = self._estop_latched
+        self._estop_latched = False
+        ok, msg = self._send_cmd("CMD_ACK_FAULT", require_online=False)
+        self._log(f"[IPC] CMD_ACK_FAULT -> {'ok' if ok else msg}"
+                  + (" (비상 정지 해제됨)" if was_estop else ""))
+        self._apply_button_state()
 
     def _on_estop(self):
+        """The one stop: arms home under the safe ceiling, teleop exits, a fresh
+        process comes back. Absorbs what [종료] used to do -- see _status_card."""
+        if self._phase == "off":
+            return
+        # Latched here, not only in the teleop process: the supervisor brings a
+        # fresh process back to keep the headset link up, and that process has a
+        # new SafetyFSM which never saw the e-stop. Without a latch on this side
+        # the operator could be offered [시작] again mid-shutdown.
+        self._estop_latched = True
         ok, msg = self._send_cmd("CMD_ESTOP", require_online=False)
         self._log(f"[IPC] CMD_ESTOP -> {'ok' if ok else msg}")
         self._sec_timer.stop()
+        self._elapsed = 0
+        self.time_lbl.setText("00:00")
         self._set_tag(False, "비상 정지")
+        self._log("비상 정지 — 팔 홈 복귀 후 종료, 이후 자동 재기동")
+        # If the shutdown wedges, _poll_proc SIGTERMs the group then SIGKILLs it.
+        # STOP_GRACE has to cover the deliberate slow homing move; killing during
+        # it would strand the arms mid-swing, the thing this path exists to avoid.
+        #
+        # Only arm the deadline on the first press: a pressed-again-because-
+        # nothing-seems-to-happen click must not push the escalation further out.
+        # It used to reset unconditionally, so an operator repeatedly pressing
+        # stop while the subprocess was stuck (e.g. an unbounded SDK call in its
+        # shutdown path -- see motion_switcher.Exit_Debug_Mode) kept deferring the
+        # one-shot SIGTERM instead of getting closer to it.
+        if self._stop_deadline is None:
+            self._stop_deadline = time.time() + self.STOP_GRACE
+        self._apply_button_state()
 
     def _status_card(self):
         card = self._card()
@@ -1432,22 +1561,28 @@ class Dashboard(QWidget):
         trow.addWidget(self.time_lbl)
         v.addLayout(trow)
 
-        self.btn_launch = self._btn("실행", primary=True)
+        # No manual "실행" button: the teleop subprocess launches itself once,
+        # right after the window is shown (see __init__'s deferred _on_launch
+        # call). 시작 stays gated the same way it always was -- phase must reach
+        # "ready" *and* _xr_block_reason() must clear, which requires a live XR
+        # link -- so auto-launching does not skip the "headset must actually be
+        # connected" check, it just removes the busywork step in front of it.
         self.btn_start = self._btn("시작", primary=True)
         self.btn_pause = self._btn("정지")
-        self.btn_stop = self._btn("종료")
-        self.btn_launch.clicked.connect(self._on_launch)
         self.btn_start.clicked.connect(self._on_start)
         self.btn_pause.clicked.connect(self._on_pause)
-        self.btn_stop.clicked.connect(self._on_stop)
 
         row1 = QHBoxLayout(); row1.setSpacing(10)
-        row1.addWidget(self.btn_launch); row1.addWidget(self.btn_stop)
-        row2 = QHBoxLayout(); row2.setSpacing(10)
-        row2.addWidget(self.btn_start); row2.addWidget(self.btn_pause)
+        row1.addWidget(self.btn_start); row1.addWidget(self.btn_pause)
         v.addLayout(row1)
-        v.addLayout(row2)
 
+        # One stop, not two. [종료] and [비상 정지] used to differ -- 종료 exited,
+        # 비상 정지 only latched following off -- but both now run the same path:
+        # freeze, drop to SAFE_ARM_VELOCITY, walk the arms home, exit, and let the
+        # supervisor bring a fresh process back. Two buttons doing the identical
+        # thing is worse than one: in the moment you need this, picking between
+        # them is hesitation. The remaining ladder is 정지 (홈 복귀 후 홀드,
+        # resumable) and this.
         self.btn_estop = QPushButton("비상 정지")
         self.btn_estop.setCursor(Qt.PointingHandCursor)
         self.btn_estop.setStyleSheet(
@@ -1525,18 +1660,28 @@ class Dashboard(QWidget):
     #         -> "ready" (idle, can 시작) -> "running" (following) -> "paused"
     def _apply_button_state(self):
         p = self._phase
-        self.btn_launch.setEnabled(p == "off")
         # 시작 additionally requires a live headset link with the operator wearing
         # it and no latched fault -- the operator should never be able to start
         # following into a headset that is not there.
         blocked = self._xr_block_reason()
         phase_ok = p in ("ready", "paused")
+        # Nothing is operable until the teleop process reports READY. The window
+        # appears within a second of launch but the process behind it needs ~10s
+        # (DDS, IK, cameras, the XR server), and every control in here is a
+        # message to a process that is not listening yet: 시작 would be refused,
+        # 비상 정지 would arm a shutdown deadline against a process still coming
+        # up. Disabling them says "not yet" instead of failing per-button.
+        # There is nothing to emergency-stop during this window either -- the
+        # arms cannot move before alignment, which cannot happen before ready --
+        # and closing the window still aborts a boot that wedges.
+        booting = p in ("off", "starting")
         self.btn_start.setEnabled(phase_ok and blocked is None)
-        self.btn_start.setToolTip(blocked if (phase_ok and blocked) else "")
+        self.btn_start.setToolTip(
+            "텔레옵 준비 중…" if booting else (blocked if (phase_ok and blocked) else ""))
         self.btn_pause.setEnabled(p == "running")
-        self.btn_stop.setEnabled(p != "off")
         if hasattr(self, "btn_estop"):
-            self.btn_estop.setEnabled(p not in ("off",))
+            self.btn_estop.setEnabled(not booting)
+            self.btn_estop.setToolTip("텔레옵 준비 중…" if booting else "")
         # settings are launch-time args -> body editable only before launch.
         # header stays clickable so the panel can still be expanded to view them.
         if hasattr(self, "settings_body"):
@@ -1553,6 +1698,7 @@ class Dashboard(QWidget):
         if self.proc and self.proc.poll() is None:
             self._log("이미 실행 중")
             return
+        self._cancel_respawn()
         # safety gates on the real robot, evaluated right before launch
         if self.args.domain == 0:
             if self.set_motion.value():
@@ -1578,13 +1724,16 @@ class Dashboard(QWidget):
                 cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env=env,
-                start_new_session=True)      # own process group -> killpg on exit kills children
+                start_new_session=True,      # own process group -> killpg on exit kills children
+                preexec_fn=_die_with_parent)  # ...and no orphan if we are killed outright
         except Exception as e:
             self._log(f"실행 실패: {e}")
+            self._schedule_respawn(rc="spawn-failed")
             return
+        self._launch_time = time.monotonic()
         threading.Thread(target=self._pipe_proc_output, daemon=True).start()
         self._set_phase("starting")
-        self._set_tag(False, "실행 중…")
+        self._set_tag(False, "준비 중…")   # matches the disabled-buttons window
         self._proc_timer.start(1000)
 
     def _on_start(self):
@@ -1613,18 +1762,6 @@ class Dashboard(QWidget):
         self._set_tag(False, "정지됨(홈 복귀)")
         self._log("텔레옵 정지 — 팔 홈 복귀 후 홀드")
 
-    def _on_stop(self):
-        if self._phase == "off":
-            return
-        ok, msg = self._send_cmd("CMD_STOP", require_online=False)
-        self._log(f"[IPC] CMD_STOP -> {'ok' if ok else msg}")
-        self._sec_timer.stop()
-        self._elapsed = 0
-        self.time_lbl.setText("00:00")
-        self._set_tag(False, "종료됨")
-        self._log("텔레옵 종료 요청")
-        # graceful exit expected; if not gone in 8s, _poll_proc kills the group
-        self._stop_deadline = time.time() + 8.0
 
     def _tick(self):
         self._elapsed += 1
@@ -1653,6 +1790,14 @@ class Dashboard(QWidget):
         if hb.get("STOP"):
             return  # let _poll_proc handle exit
         if self._phase == "starting" and ready and not following:
+            # A respawn that gets this far is a fresh process whose arms are
+            # already home (the exit path homed them) and which cannot follow
+            # anything until the operator passes the alignment gate. That is the
+            # re-arm ceremony, so the e-stop latch has done its job and clears
+            # here -- [비상 정지] returns the system to 준비 완료 by itself.
+            if self._estop_latched:
+                self._estop_latched = False
+                self._log("비상 정지 복구 — 팔 홈 복귀 완료, 텔레옵 재기동됨")
             self._set_phase("ready")
             self._set_tag(False, "준비 완료")
             self._log("텔레옵 준비 완료 — [시작] 가능")
@@ -1670,8 +1815,13 @@ class Dashboard(QWidget):
         motion = self.set_motion.value()
         net = self.cmb_net.currentData()
         img_ip = self.ed_camip.text().strip() or a.img_server_ip
-        cmd = [sys.executable, script, "--ipc",
+        cmd = [_teleop_python(), script, "--ipc",
                "--xr-source", "xrlink",
+               # Device telemetry is recorded on every launch. The app-side
+               # defects so far were all found after the session ended, by
+               # which point nothing had been captured; a session that is not
+               # recorded is a session that has to be run again.
+               "--xr-log",
                "--input-mode", input_mode,
                "--arm", a.arm,
                "--img-server-ip", img_ip]
@@ -1704,18 +1854,103 @@ class Dashboard(QWidget):
             self._proc_timer.stop()
             self.proc = None
             self._stop_deadline = None
+            self._kill_deadline = None
             self._set_phase("off")
             self._sec_timer.stop()
             self._elapsed = 0
             self.time_lbl.setText("00:00")
             self._set_tag(False)
             self._log(f"텔레옵 프로세스 종료 (rc={rc})")
+            self._schedule_respawn(rc)
             return
-        # still alive past the stop deadline -> force-kill the whole group
+        # still alive past the stop deadline -> SIGTERM the group, and arm a second,
+        # shorter deadline to SIGKILL it if that doesn't work either. SIGTERM alone
+        # used to be a one-shot: a subprocess stuck in an uninterruptible or slow
+        # blocking call (an SDK RPC to a robot that already vanished, say) could
+        # ignore it and just sit there with no further escalation, leaving [종료]
+        # looking permanently ignored.
         if self._stop_deadline and time.time() > self._stop_deadline:
             self._stop_deadline = None
             self._log("종료 지연 — 프로세스 그룹 강제 종료 (SIGTERM)")
             self._kill_proc_group(signal.SIGTERM)
+            self._kill_deadline = time.time() + 5.0
+            return
+        if self._kill_deadline and time.time() > self._kill_deadline:
+            self._kill_deadline = None
+            self._log("SIGTERM 무반응 — 강제 종료 (SIGKILL)")
+            self._kill_proc_group(signal.SIGKILL)
+
+    # How long [종료]/[비상 정지] may take before the dashboard stops waiting and
+    # starts signalling. Both now end with a slow homing move.
+    STOP_GRACE = 20.0
+
+    # --- respawn supervision -------------------------------------------------
+    RESPAWN_MIN = 2.0     # normal gap: let the old process group's ports free up
+    RESPAWN_MAX = 15.0    # ceiling once the child is clearly failing to come up
+    RESPAWN_YOUNG = 20.0  # a child that dies sooner than this never got running
+
+    def _schedule_respawn(self, rc):
+        """Bring the teleop process back so the headset link does not stay down.
+
+        The XrLink server the headset talks to is hosted by the teleop process.
+        Whether it exited because the operator pressed 종료, because 비상 정지
+        homed the arms and quit, or because it crashed, leaving it dead leaves
+        the device disconnected -- and reconnecting means putting the headset
+        back on and re-pairing. So the dashboard owns keeping it alive.
+
+        Backoff exists for the crash case only: a child that cannot start at all
+        (missing deps, port already bound) would otherwise respawn in a tight
+        loop and bury the log. A child that ran a real session resets it.
+        """
+        if not self._supervise:
+            return
+        ran_for = time.monotonic() - self._launch_time
+        if ran_for >= self.RESPAWN_YOUNG:
+            self._respawn_backoff = self.RESPAWN_MIN
+        else:
+            # died young -> it never became usable; back off before trying again
+            self._respawn_backoff = min(self.RESPAWN_MAX,
+                                        max(self.RESPAWN_MIN, self._respawn_backoff * 2))
+            self._log(f"기동 직후 종료 (rc={rc}, {ran_for:.1f}s) — "
+                      f"{self._respawn_backoff:.0f}초 후 재시도")
+        delay = self._respawn_backoff or self.RESPAWN_MIN
+        if ran_for >= self.RESPAWN_YOUNG:
+            self._log(f"XR 링크 유지를 위해 {delay:.0f}초 후 텔레옵 재기동")
+        self._respawn_timer = QTimer(self)
+        self._respawn_timer.setSingleShot(True)
+        self._respawn_timer.timeout.connect(self._respawn_now)
+        self._respawn_timer.start(int(delay * 1000))
+
+    def _respawn_now(self):
+        self._respawn_timer = None
+        if not self._supervise or (self.proc and self.proc.poll() is None):
+            return
+        self._on_launch()
+
+    # --- signalled shutdown --------------------------------------------------
+    def _install_signal_handlers(self):
+        def handler(signum, _frame):
+            self._term_requested = True
+        for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+
+    def _check_term(self):
+        if not self._term_requested:
+            return
+        self._term_requested = False
+        self._log("종료 신호 수신 — 텔레옵 정리 후 종료")
+        self.close()                       # runs closeEvent: stops supervising,
+        QApplication.instance().quit()     # stops the child, then tears down IPC
+
+    def _cancel_respawn(self):
+        if self._respawn_timer is not None:
+            self._respawn_timer.stop()
+            self._respawn_timer = None
 
     def _kill_proc_group(self, sig=signal.SIGTERM):
         """Signal the whole teleop process group (parent + multiprocessing children)."""
@@ -1735,23 +1970,40 @@ class Dashboard(QWidget):
         return os.path.abspath(FALLBACK_MODEL)
 
     def closeEvent(self, e):
+        # First, before anything can exit: stop respawning. The teleop process is
+        # kept alive only for as long as this window is open, and _poll_proc must
+        # not resurrect it while we are shutting it down.
+        self._supervise = False
+        self._cancel_respawn()
+        try:
+            self._proc_timer.stop()
+        except Exception:
+            pass
         try:
             self.mj.stop()
             self.cam.stop()
         except Exception:
             pass
-        # shut down teleop process group if we launched it
+        # shut down teleop process group if we launched it. The wait is
+        # STOP_GRACE, not the 5s it used to be: the exit path now walks the arms
+        # home at SAFE_ARM_VELOCITY before it tears anything down, and the old
+        # timeout expired mid-move -- so closing the window SIGTERMed the child
+        # partway through the very homing move that exists to avoid that.
         if self.proc and self.proc.poll() is None:
             try:
                 self._send_cmd("CMD_STOP", require_online=False)
-                self.proc.wait(timeout=5)
+                self.proc.wait(timeout=self.STOP_GRACE)
             except Exception:
                 # graceful exit failed -> SIGTERM the group, then SIGKILL
                 try:
                     self._kill_proc_group(signal.SIGTERM)
-                    self.proc.wait(timeout=3)
+                    self.proc.wait(timeout=5)
                 except Exception:
                     self._kill_proc_group(signal.SIGKILL)
+                    try:
+                        self.proc.wait(timeout=3)
+                    except Exception:
+                        pass
         # Stop polling before tearing the client down, so a timer callback
         # cannot land on a half-closed socket.
         for timer in ("_hb_timer", "_ui_timer", "_sec_timer", "_proc_timer"):
