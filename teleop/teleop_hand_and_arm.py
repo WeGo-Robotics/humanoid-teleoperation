@@ -40,6 +40,7 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 PAUSE_REQUEST  = False  # One-shot: on pause, return arms to home then hold (following stays off)
+SHUTDOWN_REQUEST = None # One-shot: "stop" | "estop" -- freeze -> slow -> home, then exit
 SAFETY         = None   # SafetyFSM, built during startup; gates every arm command
 ALIGN_STATE    = None   # latest AlignReport.as_dict(), or None when not aligning
 #  -------        ---------                -----------                -----------            ---------
@@ -55,7 +56,7 @@ ALIGN_STATE    = None   # latest AlignReport.as_dict(), or None when not alignin
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE, PAUSE_REQUEST, SAFETY
+    global STOP, START, RECORD_TOGGLE, PAUSE_REQUEST, SHUTDOWN_REQUEST, SAFETY
     if key == 'r':
         START = True
     elif key == 'p':
@@ -64,8 +65,15 @@ def on_press(key):
             START = False
             PAUSE_REQUEST = True
     elif key == 'q':
+        # Exit, but not abruptly: hand the main loop the same freeze -> slow ->
+        # home sequence the e-stop uses, and let it set STOP once the arms are
+        # back. Setting STOP straight from here dropped out of the loop with the
+        # arms wherever they were, and the only thing that brought them back was
+        # the finally block's go-home -- which runs at the *nominal* velocity
+        # ceiling, i.e. a full-speed swing from a pose the operator abandoned.
         START = False
-        STOP = True
+        if SHUTDOWN_REQUEST is None:
+            SHUTDOWN_REQUEST = "stop"
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
     elif key == 'a':
@@ -76,10 +84,14 @@ def on_press(key):
         else:
             logger_mp.warning("[on_press] nothing to acknowledge")
     elif key == 'e':
-        # operator emergency stop
+        # operator emergency stop: latch following off now, then hand the main
+        # loop a one-shot request to bring the arms home and exit. The homing
+        # move itself is deliberately NOT done here -- this runs on the IPC
+        # server thread, and arm commands belong to the loop that owns them.
         if SAFETY is not None:
             SAFETY.estop(time.monotonic(), "keyboard")
         START = False
+        SHUTDOWN_REQUEST = "estop"   # overrides a pending plain "stop"
     elif key == 'c':
         # cancel an alignment in progress (same effect as never having started)
         if START:
@@ -87,6 +99,32 @@ def on_press(key):
             logger_mp.info("alignment cancelled")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
+
+# How long a signalled shutdown may take before we stop being polite about it.
+# Generous on purpose: it has to cover the slow homing move plus the whole
+# teardown, and cutting that short is what strands the arms mid-swing.
+SIGNAL_HARD_EXIT_S = 30.0
+
+
+def _on_terminate(signum, _frame):
+    """Turn SIGTERM/SIGHUP into the normal safe shutdown.
+
+    Without this the default disposition kills the process outright: no homing
+    move, no `finally`, arms left wherever they were. That path is reached more
+    often than it looks -- the dashboard sets PR_SET_PDEATHSIG on this process,
+    so if the dashboard itself is SIGKILLed the kernel sends us SIGTERM, and
+    that is precisely the moment nobody is left to clean up after us.
+    """
+    global SHUTDOWN_REQUEST
+    logger_mp.warning(f"signal {signum} — shutting down (arms home first)")
+    if SHUTDOWN_REQUEST is None:
+        SHUTDOWN_REQUEST = "stop"
+    # Backstop, not the plan: if the main loop is wedged somewhere it cannot be
+    # signalled out of, do not become the orphan that outlives its parent.
+    t = threading.Timer(SIGNAL_HARD_EXIT_S, lambda: os._exit(1))
+    t.daemon = True
+    t.start()
+
 
 def get_state() -> dict:
     """Return current heartbeat state"""
@@ -103,6 +141,13 @@ def get_state() -> dict:
     return state
 
 if __name__ == '__main__':
+    import signal as _signal
+    for _sig in (_signal.SIGTERM, _signal.SIGHUP):
+        try:
+            _signal.signal(_sig, _on_terminate)
+        except (ValueError, OSError):
+            pass   # not the main thread, or the platform has no such signal
+
     parser = argparse.ArgumentParser()
     # basic control parameters
     parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
@@ -197,6 +242,12 @@ if __name__ == '__main__':
         logger_mp.error("⚠️  START-ALIGNMENT GATE SKIPPED (--skip-align)")
         logger_mp.error("⚠️  The arms will jump to your pose the instant you start.")
         logger_mp.error("=" * 70)
+
+    # Set once the shutdown path has already walked the arms home under the
+    # reduced velocity ceiling, so the finally block below does not immediately
+    # repeat the trip at the nominal ceiling -- a second, full-speed swing right
+    # after the careful one, and ~5s of extra shutdown for nothing.
+    homed_on_shutdown = False
 
     try:
         # setup dds communication domains id
@@ -399,7 +450,11 @@ if __name__ == '__main__':
         logger_mp.info("🟠  Press [e] for an emergency stop, [a] to acknowledge a safety fault.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
-        while not START and not STOP: # wait for start or stop signal.
+        # wait for start or stop signal. SHUTDOWN_REQUEST is in the condition
+        # because a stop arriving while idle sets neither START nor STOP -- without
+        # it this loop would spin forever and the request would look ignored.
+        # Falling through hands it to the main loop, which owns the arm commands.
+        while not START and not STOP and SHUTDOWN_REQUEST is None:
             time.sleep(0.033)
             # Keep the safety telemetry live while idle so the dashboard can show
             # headset link state and refuse to arm until the operator is present.
@@ -473,6 +528,34 @@ if __name__ == '__main__':
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
+
+            # --- shutdown: home safely, then exit -----------------------------
+            # Every way out lands here: CMD_ESTOP, CMD_STOP, the controller's A
+            # button, and a SIGTERM. Leaving following latched off
+            # is not enough on its own: it leaves the arms wherever the operator
+            # abandoned them, mid-reach. Bring them home under the reduced
+            # SAFE_ARM_VELOCITY ceiling first -- `safe_stop` freezes before it
+            # slows before it homes, so whatever motion was in flight is arrested
+            # before the (large) trip home starts -- and only then begin the exit.
+            if SHUTDOWN_REQUEST:
+                _why = SHUTDOWN_REQUEST
+                SHUTDOWN_REQUEST = None
+                logger_mp.error(
+                    ("🛑 EMERGENCY STOP" if _why == "estop" else "⏹️  STOP")
+                    + " — arms returning home safely, then exit")
+                # base first: stop walking before starting a slow arm move
+                if args.input_mode == "controller" and args.motion:
+                    try:
+                        loco_wrapper.Move(0, 0, 0)
+                    except Exception as e:
+                        logger_mp.error(f"Failed to stop locomotion on {_why}: {e}")
+                try:
+                    arm_ctrl.safe_stop(go_home=True)
+                    homed_on_shutdown = True
+                except Exception as e:
+                    logger_mp.error(f"Failed to home arms on {_why}: {e}")
+                STOP = True
+                continue
 
             # --- START edge: enter ALIGNMENT, not following -------------------
             # Every entry into following goes through alignment, so a resume
@@ -687,10 +770,12 @@ if __name__ == '__main__':
             
             # high level control
             if args.input_mode == "controller" and args.motion:
-                # quit teleoperate
+                # quit teleoperate -- same safe path as CMD_STOP: next iteration
+                # homes the arms under the reduced velocity ceiling, then exits
                 if frame.right_ctrl_aButton:
                     START = False
-                    STOP = True
+                    if SHUTDOWN_REQUEST is None:
+                        SHUTDOWN_REQUEST = "stop"
                 # command robot to enter damping mode. soft emergency stop function
                 if frame.left_ctrl_thumbstick and frame.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
@@ -872,10 +957,14 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to restore arm velocity limit: {e}")
 
-        try:
-            arm_ctrl.ctrl_dual_arm_go_home()
-        except Exception as e:
-            logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+        # Skipped when the shutdown block above already homed the arms
+        # deliberately and slowly; still runs for every other way out (crash,
+        # Ctrl-C, an exception before the main loop), where nothing has.
+        if not homed_on_shutdown:
+            try:
+                arm_ctrl.ctrl_dual_arm_go_home()
+            except Exception as e:
+                logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
         
         try:
             if args.ipc:
