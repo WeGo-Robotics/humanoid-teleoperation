@@ -195,11 +195,11 @@ if __name__ == '__main__':
                         help = 'Head-camera frames wider than this are scaled down '
                                'before being sent to the XR device')
     # start-alignment gate
-    parser.add_argument('--align-pos-tol', type = float, default = 0.10,
+    parser.add_argument('--align-pos-tol', type = float, default = 0.16,
                         help = 'Per-wrist position tolerance for the start-alignment gate (m)')
-    parser.add_argument('--align-rot-tol', type = float, default = 25.0,
+    parser.add_argument('--align-rot-tol', type = float, default = 35.0,
                         help = 'Per-wrist orientation tolerance for the start-alignment gate (deg)')
-    parser.add_argument('--align-hold', type = float, default = 2.0,
+    parser.add_argument('--align-hold', type = float, default = 1.2,
                         help = 'Seconds the operator must hold the confirm gesture in position')
     parser.add_argument('--skip-align', action = 'store_true',
                         help = 'DANGEROUS. Skip the start-alignment gate; following begins '
