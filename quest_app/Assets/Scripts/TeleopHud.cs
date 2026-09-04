@@ -94,6 +94,11 @@ namespace WeGo.Teleop
 
         // ------------------------------------------------------------------
         private Transform _panel;
+        private RectTransform _content;
+        private RectTransform _handle;
+        private Text _handleLabel;
+        private Image _grabChip, _grabChipBorder;
+        private Text _grabChipLabel;
         private Font _font;
 
         private Text _facing, _posture, _pill, _message, _sub, _reason, _link;
@@ -127,6 +132,39 @@ namespace WeGo.Teleop
         public void SetStageTexture(Texture texture)
         {
             if (_stageImage != null) _stageImage.texture = texture;
+        }
+
+        // ------------------------------------------------------------------
+        // surface for TeleopHudGrab
+        // ------------------------------------------------------------------
+
+        /// <summary>The console's world transform. Its local units are panel
+        /// units, so InverseTransformPoint on a world hit gives coordinates
+        /// directly comparable to <see cref="ActiveSizeUnits"/>.</summary>
+        public Transform PanelTransform => _panel;
+
+        /// <summary>Collapsed to its handle. The console is still live and
+        /// still following -- this hides it, it does not stop it.</summary>
+        public bool Collapsed { get; private set; }
+
+        /// <summary>What is on screen right now, in panel units. The grab
+        /// hit-test needs the handle's rectangle when collapsed, not the
+        /// console's, or a collapsed console would still swallow every ray
+        /// that crossed the space it used to occupy.</summary>
+        public Vector2 ActiveSizeUnits => Collapsed ? new Vector2(HandleW, HandleH)
+                                                    : new Vector2(W, H);
+
+        /// <summary>Where the operator has dragged the console to, as a
+        /// rotation about the head. See Follow().</summary>
+        public float YawOffsetDeg;
+        public float PitchOffsetDeg;
+
+        public void SetCollapsed(bool collapsed)
+        {
+            if (Collapsed == collapsed || _content == null) return;
+            Collapsed = collapsed;
+            _content.gameObject.SetActive(!collapsed);
+            _handle.gameObject.SetActive(collapsed);
         }
 
         private void LateUpdate()
@@ -169,15 +207,29 @@ namespace WeGo.Teleop
             var drop = Distance * Mathf.Tan(TopEdgeBelowHorizon * Mathf.Deg2Rad)
                      + halfHeight + halfHeight * ExtraDropInPanelHeights * 2f;
 
-            var target = headPos + forward * Distance + Vector3.down * drop;
+            // The default placement, expressed as a direction and a radius so
+            // the operator's drag can rotate it (TeleopHudGrab) without
+            // changing how far away it sits. At zero offset this is exactly
+            // headPos + forward * Distance + down * drop, as before.
+            var yawFrame = Quaternion.LookRotation(forward, Vector3.up);
+            var restDir = new Vector3(0f, -drop, Distance);
+            var radius = restDir.magnitude;
+            var dir = yawFrame * (Quaternion.Euler(PitchOffsetDeg, YawOffsetDeg, 0f)
+                                  * restDir.normalized);
+
+            var target = headPos + dir * radius;
 
             // Upright, not aimed at the eye. LookRotation(target - headPos)
             // points the panel's normal along the head-to-panel vector, and
             // once the panel hangs below eye level that vector slopes
             // downward -- so the top leaned away from the operator and the
             // bottom leaned toward them. Facing along the horizontal forward
-            // keeps the panel vertical and the text square.
-            var look = Quaternion.LookRotation(forward, Vector3.up);
+            // keeps the panel vertical and the text square. The drag's yaw is
+            // folded in so a console pushed to the side still squares up to
+            // the operator; its pitch deliberately is not, for the same reason
+            // the rest placement ignores head pitch.
+            var faceDir = yawFrame * (Quaternion.Euler(0f, YawOffsetDeg, 0f) * Vector3.forward);
+            var look = Quaternion.LookRotation(faceDir, Vector3.up);
 
             // Framerate-independent smoothing; a plain Lerp factor would make
             // the console lag differently at 72Hz and 90Hz.
@@ -196,6 +248,16 @@ namespace WeGo.Teleop
             var colour = ColourFor(state, Session.LinkConnected);
             var aligning = state == "ALIGN";
 
+            if (Collapsed)
+            {
+                // The handle carries the state and nothing else. Filling in the
+                // rest would be several hundred Text assignments a frame against
+                // a hierarchy that is switched off.
+                _handleLabel.text = state;
+                _handleLabel.color = colour;
+                return;
+            }
+
             var e = Session.HeadRotation.eulerAngles;
             _facing.text = $"facing {Mathf.RoundToInt(Mathf.DeltaAngle(0f, e.y))}°   ·   " +
                            $"pitch {-Mathf.RoundToInt(Mathf.DeltaAngle(0f, e.x))}°";
@@ -211,8 +273,14 @@ namespace WeGo.Teleop
                 ? (aligning ? "hold both triggers to confirm" : DefaultMessage(state))
                 : Session.AlignReason;
 
+            // Both triggers are held for the WHOLE gate, skip included -- X + A
+            // only waives the position check, it does not replace the confirm
+            // gesture. Phrased as one combined instruction rather than two
+            // bullets, which read as alternatives and was the reason X + A
+            // alone looked broken (see 39611d7 / 1be0835 in git log).
             _sub.text = aligning
-                ? "Hands inside the rings  ·  both triggers to confirm  ·  X + A together to skip"
+                ? "Hands inside the rings, hold both triggers to confirm  ·  " +
+                  "still holding triggers, add X + A to skip the position check"
                 : "";
 
             // The camera stream owns the stage only once alignment has
@@ -443,11 +511,57 @@ namespace WeGo.Teleop
             root.localScale = Vector3.one * MetresPerUnit;
             _panel = canvasGo.transform;
 
-            BuildShell(root);
-            BuildHeader(root);
-            BuildLeftColumn(root);
-            BuildStageColumn(root);
-            BuildRightColumn(root);
+            // Everything the console draws hangs off _content rather than the
+            // canvas itself, so collapsing is one SetActive rather than a walk
+            // over every child. The handle is its sibling: exactly one of the
+            // two is ever on.
+            _content = Wrapper("Content", root, new Vector2(W, H));
+
+            BuildShell(_content);
+            BuildHeader(_content);
+            BuildLeftColumn(_content);
+            BuildStageColumn(_content);
+            BuildRightColumn(_content);
+
+            BuildHandle(root);
+        }
+
+        // The collapsed console. Sized to stay legible at Distance without
+        // occupying the view: 460x120 units is 0.44 x 0.11 m at 1.45 m, about
+        // 17 degrees across -- big enough to aim a controller ray at, small
+        // enough to leave the room visible, which is the entire point of
+        // collapsing it.
+        private const float HandleW = 460f, HandleH = 120f;
+
+        private void BuildHandle(RectTransform root)
+        {
+            _handle = Wrapper("Handle", root, new Vector2(HandleW, HandleH));
+
+            Sprite9(_handle, TeleopHudTextures.RoundedRect(26), ConsoleBg,
+                    Anchor05, Vector2.zero, new Vector2(HandleW, HandleH));
+            Sprite9(_handle, TeleopHudTextures.RoundedRect(26, 2f), Border,
+                    Anchor05, Vector2.zero, new Vector2(HandleW, HandleH));
+
+            // The state, because a collapsed console must still answer the one
+            // question it exists to answer. Tinted by the same ColourFor the
+            // pill uses, so a red state reads red here too.
+            _handleLabel = Label(_handle, 34, FontStyle.Bold, Green, TextAnchor.MiddleCenter,
+                                 new Vector2(0f, -20f), new Vector2(HandleW, 48f));
+
+            Label(_handle, 20, FontStyle.Normal, Dim, TextAnchor.MiddleCenter,
+                  new Vector2(0f, -74f), new Vector2(HandleW, 30f))
+                .text = "grip-click to reopen";
+
+            _handle.gameObject.SetActive(false);
+        }
+
+        /// <summary>A bare full-rect child, centred on its parent, used only to
+        /// give a group of graphics a single GameObject to switch off.</summary>
+        private static RectTransform Wrapper(string name, RectTransform parent, Vector2 size)
+        {
+            var go = new GameObject(name, typeof(RectTransform));
+            Place(go, parent, Anchor05, Vector2.zero, size);
+            return (RectTransform)go.transform;
         }
 
         private void BuildShell(RectTransform root)
@@ -478,14 +592,51 @@ namespace WeGo.Teleop
             _facing = Label(root, 30, FontStyle.Normal, GreenHi, TextAnchor.UpperCenter,
                             new Vector2(0f, -24f), new Vector2(W, 40f));
 
-            // The mock's RECENTER button, as a prompt: there is no pointer in
-            // this app, so it names the control instead of pretending to be one.
+            // The mock's RECENTER button, as a prompt. There is a pointer in
+            // this app now (TeleopHudGrab), but it is bound to the grip and
+            // does exactly one thing; recentre is not on it, so this still
+            // names its control rather than pretending to be a button.
             Label(root, 24, FontStyle.Normal, Dim, TextAnchor.UpperRight,
                   new Vector2(-Pad - 40f, -26f), new Vector2(360f, 34f))
                 .text = "RECENTER — hold ☰";
 
             _posture = Label(root, 38, FontStyle.Bold, White, TextAnchor.UpperCenter,
                              new Vector2(0f, -70f), new Vector2(W, 46f));
+
+            BuildGrabChip(root);
+        }
+
+        // The console is grabbable anywhere on its face, which is forgiving to
+        // use and completely invisible: the only cue was a ray that appears
+        // once you are already pointing at it, which you have no reason to do.
+        // This is the affordance -- XRoboToolkit's UISurroundDrag has the same
+        // thing as its OpenImage/CloseImage on the panel's own handle.
+        //
+        // It is a label, not a hit target. Making the chip the only grab region
+        // would trade a discoverability problem for an aiming one, on a panel
+        // the operator wants out of the way in a hurry.
+        private void BuildGrabChip(RectTransform root)
+        {
+            const float chipW = 470f, chipH = 46f;
+            var pos = new Vector2(Pad + 44f, -20f);
+
+            _grabChip = Sprite9(root, TeleopHudTextures.RoundedRect(14), PanelBg,
+                                AnchorTopLeft, pos, new Vector2(chipW, chipH));
+            _grabChipBorder = Sprite9(root, TeleopHudTextures.RoundedRect(14, 2f), Border,
+                                      AnchorTopLeft, pos, new Vector2(chipW, chipH));
+            _grabChipLabel = Label(root, 22, FontStyle.Bold, GreenLo, TextAnchor.MiddleCenter,
+                                   pos, new Vector2(chipW, chipH));
+            _grabChipLabel.text = "☰  GRIP TO MOVE  ·  GRIP-CLICK TO CLOSE";
+        }
+
+        /// <summary>Brighten the chip while a controller ray is on the console,
+        /// so the affordance confirms itself before the operator commits to
+        /// squeezing anything.</summary>
+        public void SetGrabHighlight(bool on)
+        {
+            if (_grabChipBorder == null) return;
+            _grabChipBorder.color = on ? GreenHi : Border;
+            _grabChipLabel.color = on ? GreenHi : GreenLo;
         }
 
         // ------------------------------------------------------------------
@@ -595,8 +746,12 @@ namespace WeGo.Teleop
         {
             // The stage itself. Bordered like a panel but with no header, so
             // the image is the whole of it -- which is what it has to be when
-            // the camera stream takes it over.
-            var frame = Sprite9(root, TeleopHudTextures.RoundedRect(14), new Color(0f, 0f, 0f, 0.85f),
+            // the camera stream takes it over. Transparent, not the old
+            // near-opaque black: TeleopStage's own camera now clears
+            // transparent too (see TeleopStage.cs), and a solid backing panel
+            // here would have blocked the passthrough backdrop from showing
+            // through regardless of that. Border only, no fill.
+            var frame = Sprite9(root, TeleopHudTextures.RoundedRect(14), new Color(0f, 0f, 0f, 0f),
                                 AnchorTopLeft, new Vector2(StageX, ColTop),
                                 new Vector2(StageW, StageH)).rectTransform;
             Sprite9(frame, TeleopHudTextures.RoundedRect(14, 2f), Border,
@@ -678,8 +833,10 @@ namespace WeGo.Teleop
             _confirmFill = BuildHold(root, new Vector2(StageX, holdsTop),
                                      "HOLD CONFIRM  (triggers)", out _confirmLabel,
                                      out _confirmFillRect);
+            // "+ X+A": additive to the confirm hold on the left, not a
+            // separate way in -- see the _sub.text comment above.
             _skipFill = BuildHold(root, new Vector2(StageX + HoldW + 16f, holdsTop),
-                                  "HOLD SKIP  (X + A)", out _skipLabel, out _skipFillRect);
+                                  "HOLD SKIP  (+ X + A)", out _skipLabel, out _skipFillRect);
 
             _reason = Label(root, 22, FontStyle.Normal, GreenLo, TextAnchor.MiddleLeft,
                             new Vector2(StageX + 2f * HoldW + 44f, holdsTop),

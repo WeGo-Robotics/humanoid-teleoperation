@@ -95,6 +95,11 @@ namespace WeGo.Teleop
         /// when it was the readout that was wrong.</summary>
         public bool ConfirmHeld;
         public bool SkipHeld;
+
+        /// <summary>Grip buttons, client-side only. Never sent to the host --
+        /// see PollButtons for why that is deliberate and why it makes the
+        /// grip the safe control for the console's own gestures.</summary>
+        public bool LeftGrip, RightGrip;
         public float LeftPosError = float.PositiveInfinity;
         public float RightPosError = float.PositiveInfinity;
 
@@ -289,6 +294,14 @@ namespace WeGo.Teleop
             PollCameraFrames();
             DrainHostMessages();
 
+            // Before the link gate below, deliberately. The console's grab
+            // (TeleopHudGrab) is the operator tidying their own display: it is
+            // not a session concern, and DISCONNECTED is exactly when they are
+            // most likely to want it and exactly when the early return below
+            // would otherwise have left it dead. Everything read here is
+            // client-side and never reaches the wire.
+            PollLocalControls();
+
             LinkConnected = _link != null && _link.IsConnected;
             SkippedFrames = _link?.SkippedFrames ?? 0;
             if (!LinkConnected)
@@ -326,6 +339,30 @@ namespace WeGo.Teleop
         /// anything is held. The host's set is replaced wholesale by each
         /// message, so the repeat is what makes a dropped message harmless --
         /// it matters because two of these buttons stop the robot.</summary>
+        /// <summary>Controls the app answers for itself, with no host involved.
+        ///
+        /// The grips, and deliberately NOT via Collect() into _pressed: the
+        /// wire protocol has no grip -- codec.py's BUTTON_NAMES does not list
+        /// one and no INPUT_FIELD could carry it -- so sending it would be a
+        /// name the host silently discards. That absence is exactly what makes
+        /// the grip the right control for moving and collapsing the console
+        /// (TeleopHudGrab): it is the one input on the pad that cannot collide
+        /// with the align gate, which owns both triggers and X + A for the
+        /// whole of its duration.</summary>
+        private void PollLocalControls()
+        {
+            LeftGrip = GetButton(LeftDevice(), CommonUsages.gripButton);
+            RightGrip = GetButton(RightDevice(), CommonUsages.gripButton);
+
+            if (Time.unscaledTime - _lastGripLog < DiagLogInterval) return;
+            _lastGripLog = Time.unscaledTime;
+            Debug.Log($"[Teleop] grips left={LeftGrip} right={RightGrip} " +
+                      $"(devices valid L={LeftDevice().isValid} R={RightDevice().isValid})");
+            LogControllerFeaturesOnce();
+        }
+
+        private float _lastGripLog;
+
         private void PollButtons()
         {
             _pressed.Clear();
@@ -412,6 +449,35 @@ namespace WeGo.Teleop
             return device.TryGetFeatureValue(usage, out var pressed) && pressed;
         }
 
+        /// <summary>Every feature the controllers actually expose, once.
+        ///
+        /// This app has been bitten twice by an input that exists in the API
+        /// and returns nothing on this hardware (OVRInput's buttons, then its
+        /// connected-controller list -- docs 14). Guessing a third time is not
+        /// worth a build cycle: TeleopHudGrab needs the grip, so the question
+        /// of whether "GripButton" is in this list is worth answering out
+        /// loud rather than inferring from a control that appears not to
+        /// work.</summary>
+        private bool _featuresLogged;
+
+        private void LogControllerFeaturesOnce()
+        {
+            if (_featuresLogged) return;
+            var left = LeftDevice();
+            var right = RightDevice();
+            if (!left.isValid && !right.isValid) return;
+            _featuresLogged = true;
+
+            var usages = new List<InputFeatureUsage>();
+            if (left.isValid && left.TryGetFeatureUsages(usages))
+                Debug.Log($"[Teleop] left controller features: " +
+                          $"{string.Join(", ", usages.ConvertAll(u => u.name))}");
+            usages.Clear();
+            if (right.isValid && right.TryGetFeatureUsages(usages))
+                Debug.Log($"[Teleop] right controller features: " +
+                          $"{string.Join(", ", usages.ConvertAll(u => u.name))}");
+        }
+
         private void Collect(InputDevice device, InputFeatureUsage<bool> usage, string name)
         {
             if (GetButton(device, usage)) _pressed.Add(name);
@@ -482,7 +548,8 @@ namespace WeGo.Teleop
                           $"rightDeviceValid={RightDevice().isValid} " +
                           $"leftTracked={leftOk} rightTracked={rightOk} " +
                           $"head=({headPose.GetColumn(3).x:F3},{headPose.GetColumn(3).y:F3},{headPose.GetColumn(3).z:F3}) " +
-                          $"trig=({lTrig:F2},{rTrig:F2}) pressed=({string.Join(",", _pressed)})");
+                          $"trig=({lTrig:F2},{rTrig:F2}) grip=({LeftGrip},{RightGrip}) " +
+                          $"pressed=({string.Join(",", _pressed)})");
             }
 
             return new TrackingSample

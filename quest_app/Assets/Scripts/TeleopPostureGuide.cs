@@ -28,11 +28,23 @@ namespace WeGo.Teleop
         [Header("Controller markers")]
         public float MarkerRadius = 0.045f;
 
-        private static readonly Color Marker = new Color(0.75f, 0.92f, 1.00f, 0.90f);
+        // Brighter and fully opaque, was (0.75, 0.92, 1.00, 0.90): against a
+        // flat fallback background the pale, translucent version stood out
+        // fine, but the background is now a live camera feed and a pale
+        // marker can land on a same-toned patch of the real room and nearly
+        // vanish. See Outline below for the other half of the fix.
+        private static readonly Color Marker = new Color(0.35f, 0.85f, 1.00f, 1f);
+
+        /// <summary>Dark outline behind each marker, same reasoning as
+        /// TeleopAlignGuide's ring outline.</summary>
+        private static readonly Color Outline = new Color(0.02f, 0.02f, 0.03f, 0.9f);
+        private const float OutlineDepthOffset = 0.004f;
 
         private Material _material;
         private LineRenderer _leftMarker, _rightMarker;
         private LineRenderer _leftRay, _rightRay;
+        private LineRenderer _leftMarkerOutline, _rightMarkerOutline;
+        private LineRenderer _leftRayOutline, _rightRayOutline;
 
         private const int MarkerSegments = 20;
 
@@ -47,6 +59,10 @@ namespace WeGo.Teleop
             }
             _material = new Material(shader);
 
+            _leftMarkerOutline = Line("CtrlOutlineL", MarkerSegments + 1, 0.011f, true);
+            _rightMarkerOutline = Line("CtrlOutlineR", MarkerSegments + 1, 0.011f, true);
+            _leftRayOutline = Line("CtrlRayOutlineL", 2, 0.009f, false);
+            _rightRayOutline = Line("CtrlRayOutlineR", 2, 0.009f, false);
             _leftMarker = Line("CtrlL", MarkerSegments + 1, 0.005f, true);
             _rightMarker = Line("CtrlR", MarkerSegments + 1, 0.005f, true);
             _leftRay = Line("CtrlRayL", 2, 0.004f, false);
@@ -82,42 +98,55 @@ namespace WeGo.Teleop
         // ------------------------------------------------------------------
         private void DrawControllers(bool on)
         {
-            _leftMarker.enabled = on;
-            _rightMarker.enabled = on;
-            _leftRay.enabled = on;
-            _rightRay.enabled = on;
+            _leftMarker.enabled = on; _leftMarkerOutline.enabled = on;
+            _rightMarker.enabled = on; _rightMarkerOutline.enabled = on;
+            _leftRay.enabled = on; _leftRayOutline.enabled = on;
+            _rightRay.enabled = on; _rightRayOutline.enabled = on;
             if (!on) return;
 
-            DrawHand(_leftMarker, _leftRay, Session.LeftWristPosition,
-                     Session.LeftWristRotation);
-            DrawHand(_rightMarker, _rightRay, Session.RightWristPosition,
-                     Session.RightWristRotation);
+            DrawHand(_leftMarker, _leftMarkerOutline, _leftRay, _leftRayOutline,
+                     Session.LeftWristPosition, Session.LeftWristRotation);
+            DrawHand(_rightMarker, _rightMarkerOutline, _rightRay, _rightRayOutline,
+                     Session.RightWristPosition, Session.RightWristRotation);
         }
 
-        private void DrawHand(LineRenderer ring, LineRenderer ray,
+        private void DrawHand(LineRenderer ring, LineRenderer ringOutline,
+                              LineRenderer ray, LineRenderer rayOutline,
                               Vector3 pos, Quaternion rot)
         {
             // A ring in the controller's own plane plus a short forward stub.
             // The stub is what makes the roll visible; a bare dot cannot show
             // that a controller is upside down, and an upside-down controller
-            // is a real way to fail the rotation half of the gate.
+            // is a real way to fail the rotation half of the gate. Each has a
+            // dark outline set back along -fwd (away from the operator, who
+            // is generally looking down the ray toward the controller) for
+            // contrast against the live camera background -- see Outline.
             var fwd = rot * Vector3.forward;
             var right = rot * Vector3.right;
             var up = rot * Vector3.up;
+            var behind = pos - fwd * OutlineDepthOffset;
 
             ring.positionCount = MarkerSegments + 1;
+            ringOutline.positionCount = MarkerSegments + 1;
             for (var i = 0; i <= MarkerSegments; i++)
             {
                 var th = (float)i / MarkerSegments * Mathf.PI * 2f;
-                ring.SetPosition(i, pos + (right * Mathf.Cos(th) + up * Mathf.Sin(th))
-                                          * MarkerRadius);
+                var offset = (right * Mathf.Cos(th) + up * Mathf.Sin(th)) * MarkerRadius;
+                ring.SetPosition(i, pos + offset);
+                ringOutline.SetPosition(i, behind + offset);
             }
             Tint(ring, Marker);
+            Tint(ringOutline, Outline);
 
             ray.positionCount = 2;
             ray.SetPosition(0, pos);
             ray.SetPosition(1, pos + fwd * (MarkerRadius * 2.4f));
             Tint(ray, Marker);
+
+            rayOutline.positionCount = 2;
+            rayOutline.SetPosition(0, behind);
+            rayOutline.SetPosition(1, behind + fwd * (MarkerRadius * 2.4f));
+            Tint(rayOutline, Outline);
         }
 
         private static void Tint(LineRenderer lr, Color c)

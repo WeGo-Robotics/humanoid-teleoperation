@@ -188,7 +188,16 @@ namespace WeGo.Teleop.Editor
         private static void ConfigureXr()
         {
             var perTarget = GetOrCreateXrSettings();
-            perTarget.CreateDefaultManagerSettingsForBuildTarget(BuildTargetGroup.Android);
+            // Guarded, not unconditional. CreateDefaultManagerSettingsForBuildTarget
+            // always news up an XRManagerSettings, names it "Android Providers",
+            // makes it the Manager and AddObjectToAsset's it -- so calling it on
+            // every build orphans the previous one inside
+            // Assets/XR/XRGeneralSettings.asset and never removes it. That file
+            // had accumulated thirty dead "Android Providers" sub-assets by
+            // 2026-09-04, and every build was also discarding a configured
+            // manager to rebuild it from empty.
+            if (!perTarget.HasManagerSettingsForBuildTarget(BuildTargetGroup.Android))
+                perTarget.CreateDefaultManagerSettingsForBuildTarget(BuildTargetGroup.Android);
             var settings = perTarget.SettingsForBuildTarget(BuildTargetGroup.Android);
             if (settings == null || settings.Manager == null)
                 throw new Exception("XR Management produced no manager for Android");
@@ -198,18 +207,147 @@ namespace WeGo.Teleop.Editor
             if (already)
             {
                 Log("Oculus XR loader already active");
-                return;
+            }
+            else
+            {
+                if (!UnityEditor.XR.Management.Metadata.XRPackageMetadataStore.AssignLoader(
+                        settings.Manager, OculusLoader, BuildTargetGroup.Android))
+                    throw new Exception(
+                        $"could not assign {OculusLoader}. Is com.unity.xr.oculus " +
+                        "resolved in Packages/manifest.json?");
+
+                EditorUtility.SetDirty(settings.Manager);
+                AssetDatabase.SaveAssets();
+                Log("assigned the Oculus XR loader for Android");
             }
 
-            if (!UnityEditor.XR.Management.Metadata.XRPackageMetadataStore.AssignLoader(
-                    settings.Manager, OculusLoader, BuildTargetGroup.Android))
-                throw new Exception(
-                    $"could not assign {OculusLoader}. Is com.unity.xr.oculus " +
-                    "resolved in Packages/manifest.json?");
+            EnsureOculusSettingsRegistered();
+        }
 
-            EditorUtility.SetDirty(settings.Manager);
+        internal const string OculusSettingsAssetPath = "Assets/XR/Settings/OculusSettings.asset";
+
+        /// <summary>The key OculusBuildProcessor reads its settings from --
+        /// declared there as OculusBuildProcessor.BuildSettingsKey.</summary>
+        private const string OculusSettingsKey = "Unity.XR.Oculus.Settings";
+
+        // Registers OculusSettings.asset as an EditorBuildSettings config
+        // object. Without this the built player carries no OculusSettings at
+        // all, and that one fact caused both of the failures this app has been
+        // chasing since 2026-08-25.
+        //
+        // The chain. OculusBuildProcessor derives from
+        // XRBuildHelper<OculusSettings>, whose OnPreprocessBuild calls
+        // SetSettingsForRuntime(SettingsForBuildTargetGroup(..)), and
+        // SettingsForBuildTargetGroup is nothing but
+        // EditorBuildSettings.TryGetConfigObject("Unity.XR.Oculus.Settings", ..).
+        // That key is only ever written by the XR Plug-in Management *window*,
+        // which a headless batchmode build never opens; XRPackageMetadataStore
+        // .AssignLoader does not write it either. So the key was absent,
+        // TryGetConfigObject returned null, and SetSettingsForRuntime ran its
+        // unconditional CleanOldSettings<OculusSettings>() -- which strips every
+        // OculusSettings out of Preloaded Assets -- and then returned early
+        // without putting one back.
+        //
+        // That is also why the previous fix here logged success and changed
+        // nothing on device: it added the asset to Preloaded Assets before
+        // BuildPlayer, and the provider's own preprocess hook deleted the entry
+        // again on the way in. Ordering, not the wrong asset.
+        //
+        // What a null OculusSettings then broke, on every launch:
+        //
+        //   * OculusLoader.Initialize() wraps its entire native handoff in
+        //     `if (settings != null)`, so NativeMethods.SetUserDefinedSettings
+        //     was never called: the native display was never told the stereo
+        //     rendering mode (Multiview), the colour space (Linear), or the
+        //     shared depth buffer. Initialize() still returns true, because the
+        //     subsystems themselves create fine -- so the app "runs" while the
+        //     compositor holds a swapchain nobody configured. That is the
+        //     intermittent black screen, and the Unity splash goes missing with
+        //     it because the splash renders through the same display subsystem.
+        //
+        //   * OVRManager.InitOVRManager() (OVRManager.cs:2408-2414) null-checks
+        //     the loader but not GetSettings(), then reads
+        //     oculusSettings.DepthSubmission -- NullReferenceException, thrown
+        //     before OVRManagerinitialized is ever set. That is what has kept
+        //     Insight Passthrough dead and pushed TeleopPassthrough onto raw
+        //     PassthroughCameraAccess instead.
+        //
+        // Registering the key lets Unity's own build processor do the Preloaded
+        // Assets work, every build, at the right point in the pipeline.
+        // OculusSettingsPreloadGuard below then checks that it actually did.
+        private static void EnsureOculusSettingsRegistered()
+        {
+            var oculusSettings =
+                AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(OculusSettingsAssetPath)
+                ?? CreateOculusSettings();
+            if (oculusSettings == null) return;
+
+            if (EditorBuildSettings.TryGetConfigObject(OculusSettingsKey,
+                                                       out UnityEngine.Object current)
+                && current == oculusSettings)
+            {
+                Log($"OculusSettings already registered under '{OculusSettingsKey}'");
+            }
+            else
+            {
+                EditorBuildSettings.AddConfigObject(OculusSettingsKey, oculusSettings, true);
+                Log($"registered {OculusSettingsAssetPath} under '{OculusSettingsKey}'");
+            }
+
+            EnsureQuestTargets(oculusSettings);
+        }
+
+        /// <summary>Assets/XR is gitignored, so a fresh clone has no
+        /// OculusSettings asset at all -- normally it is created by the XR
+        /// Plug-in Management window, which a batchmode build never opens.
+        /// Without this, the first build on a new machine or in CI would trip
+        /// OculusSettingsPreloadGuard with nothing the operator could do about
+        /// it. Created by reflection so this file keeps its independence from
+        /// the Meta and Oculus assemblies.</summary>
+        private static UnityEngine.Object CreateOculusSettings()
+        {
+            var type = Type.GetType("Unity.XR.Oculus.OculusSettings, Unity.XR.Oculus");
+            if (type == null)
+            {
+                Warn("Unity.XR.Oculus.OculusSettings is not loaded, so no settings asset " +
+                     "can be created. Is com.unity.xr.oculus resolved?");
+                return null;
+            }
+
+            var created = ScriptableObject.CreateInstance(type);
+            Directory.CreateDirectory(Path.GetDirectoryName(OculusSettingsAssetPath));
+            AssetDatabase.CreateAsset(created, OculusSettingsAssetPath);
             AssetDatabase.SaveAssets();
-            Log("assigned the Oculus XR loader for Android");
+            Log($"created {OculusSettingsAssetPath} (none existed; Assets/XR is gitignored)");
+            return created;
+        }
+
+        /// <summary>The Target* flags in OculusSettings are the plugin's record
+        /// of which headsets the build is for. They shipped as Quest 2 only,
+        /// which matches neither the com.oculus.supportedDevices this app writes
+        /// in QuestManifest.cs nor the Quest 3 on the bench. Set from code for
+        /// the same reason everything else here is: a wrong checkbox in
+        /// generated YAML is invisible in review.</summary>
+        private static void EnsureQuestTargets(UnityEngine.Object oculusSettings)
+        {
+            var so = new SerializedObject(oculusSettings);
+            var changed = false;
+            foreach (var flag in new[] { "TargetQuest2", "TargetQuestPro",
+                                         "TargetQuest3", "TargetQuest3S" })
+            {
+                var prop = so.FindProperty(flag);
+                if (prop == null) { Warn($"OculusSettings has no {flag}"); continue; }
+                if (prop.boolValue) continue;
+                prop.boolValue = true;
+                changed = true;
+            }
+            if (!changed) return;
+
+            so.ApplyModifiedPropertiesWithoutUndo();
+            EditorUtility.SetDirty(oculusSettings);
+            AssetDatabase.SaveAssets();
+            Log("enabled Quest 2 / Pro / 3 / 3S in OculusSettings, matching the " +
+                "supportedDevices QuestManifest writes");
         }
 
         private static XRGeneralSettingsPerBuildTarget GetOrCreateXrSettings()
@@ -300,6 +438,48 @@ namespace WeGo.Teleop.Editor
             // Batchmode must exit non-zero, or CI and the wrapper script read a
             // failed build as a successful one.
             if (Application.isBatchMode) EditorApplication.Exit(1);
+        }
+    }
+
+    /// <summary>Fails the build if OculusSettings did not reach Preloaded Assets.
+    ///
+    /// callbackOrder 100 puts this after XRBuildHelper's own preprocess hook,
+    /// which runs at 0 and is the thing that both strips and re-adds the entry.
+    /// Whatever is in Preloaded Assets once this runs is what the player ships
+    /// with.
+    ///
+    /// A hard failure rather than a warning, on purpose. The symptom of getting
+    /// this wrong is not a build error: it is an APK that installs, opens to a
+    /// black void with no Unity splash, and throws a NullReferenceException
+    /// somewhere that looks unrelated -- see
+    /// QuestBuild.EnsureOculusSettingsRegistered for the full chain. That cost
+    /// eleven days. A red build costs a minute.</summary>
+    internal class OculusSettingsPreloadGuard : IPreprocessBuildWithReport
+    {
+        public int callbackOrder => 100;
+
+        public void OnPreprocessBuild(BuildReport report)
+        {
+            if (report.summary.platformGroup != BuildTargetGroup.Android) return;
+
+            var preloaded = PlayerSettings.GetPreloadedAssets() ?? new UnityEngine.Object[0];
+            var named = preloaded.Where(a => a != null).Select(a => a.name).ToArray();
+            if (preloaded.Any(a => a != null && a.GetType().Name == "OculusSettings"))
+            {
+                Debug.Log("[QuestBuild] OculusSettings is in Preloaded Assets " +
+                          $"({string.Join(", ", named)})");
+                return;
+            }
+
+            throw new BuildFailedException(
+                "OculusSettings is not in Preloaded Assets, so OculusSettings.s_Settings " +
+                "would be null in the player: the Oculus XR plugin would start without " +
+                "ever calling SetUserDefinedSettings (black screen, no Unity splash) and " +
+                "OVRManager.InitOVRManager() would throw a NullReferenceException (no " +
+                "Insight Passthrough). Preloaded Assets currently holds: " +
+                $"{(named.Length == 0 ? "nothing" : string.Join(", ", named))}. Check that " +
+                "QuestBuild.EnsureOculusSettingsRegistered registered " +
+                $"{QuestBuild.OculusSettingsAssetPath} under \"Unity.XR.Oculus.Settings\".");
         }
     }
 }

@@ -53,12 +53,21 @@ namespace WeGo.Teleop
         // Controllers are held roughly level and pointing where the operator
         // faces. The preview has no way to know a real wrist's roll, and
         // pretending otherwise would make the marker's roll stub a lie.
-        Quaternion ITeleopPoses.LeftWristRotation => Quaternion.Euler(_pitch * 0.5f, _yaw, 0f);
-        Quaternion ITeleopPoses.RightWristRotation => Quaternion.Euler(_pitch * 0.5f, _yaw, 0f);
+        //
+        // _aimYaw/_aimPitch are added on top so a grip-drag can swing the
+        // controller WITHOUT swinging the head. On device those are separate
+        // by construction; here they share a mouse, and if the wrist could
+        // only follow the head then grabbing the console and turning would
+        // move both together and appear to do nothing at all.
+        Quaternion ITeleopPoses.LeftWristRotation
+            => Quaternion.Euler(_pitch * 0.5f + _aimPitch, _yaw + _aimYaw, 0f);
+        Quaternion ITeleopPoses.RightWristRotation
+            => Quaternion.Euler(_pitch * 0.5f + _aimPitch, _yaw + _aimYaw, 0f);
 
         private Vector3 _headPos = new Vector3(0f, 1.62f, 0f);
         private Vector3 _leftWrist, _rightWrist;
         private float _yaw, _pitch;
+        private float _aimYaw, _aimPitch;
 
         // Wrist positions are held head-relative and resolved each frame, so
         // walking around does not drag the hands off the body.
@@ -183,6 +192,18 @@ namespace WeGo.Teleop
             {
                 _leftLocal = Vector3.Lerp(_leftLocal, TargetLocal(LeftTargetRobot), 6f * dt);
                 _rightLocal = Vector3.Lerp(_rightLocal, TargetLocal(RightTargetRobot), 6f * dt);
+            }
+
+            // Console grip. Q and E stand in for the left and right grip
+            // buttons; while either is down the mouse aims the controller
+            // rather than the head, so the console can be dragged around the
+            // operator and grip-clicked shut. See TeleopHudGrab.
+            Session.LeftGrip = Input.GetKey(KeyCode.Q);
+            Session.RightGrip = Input.GetKey(KeyCode.E);
+            if (Session.LeftGrip || Session.RightGrip)
+            {
+                _aimYaw += Input.GetAxisRaw("Mouse X") * 3f;
+                _aimPitch = Mathf.Clamp(_aimPitch - Input.GetAxisRaw("Mouse Y") * 3f, -60f, 60f);
             }
 
             if (Input.GetKeyDown(KeyCode.R)) Reset();

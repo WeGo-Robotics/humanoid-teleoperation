@@ -157,8 +157,12 @@ namespace WeGo.Teleop
             camGo.transform.SetParent(transform, false);
             _camera = camGo.AddComponent<Camera>();
             _camera.cullingMask = 1 << StageLayer;
+            // Transparent, not the old dark-green solid: the stage panel now
+            // sits in front of the passthrough backdrop (TeleopPassthrough),
+            // and the whole point of showing the camera feed is for it to
+            // show through here too, not stop at a painted panel.
             _camera.clearFlags = CameraClearFlags.SolidColor;
-            _camera.backgroundColor = new Color(0.016f, 0.055f, 0.035f, 1f);
+            _camera.backgroundColor = new Color(0f, 0f, 0f, 0f);
             _camera.targetTexture = _rt;
             _camera.fieldOfView = 34f;
             _camera.nearClipPlane = 0.05f;

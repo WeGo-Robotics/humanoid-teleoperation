@@ -113,6 +113,12 @@ namespace WeGo.Teleop
             hud.Stage = stage;
             hud.Anchor = head != null ? head.transform : transform;
 
+            // Lets the operator push the console aside or shut it entirely,
+            // on the grip so it cannot collide with the align gate's triggers.
+            var grab = host.AddComponent<TeleopHudGrab>();
+            grab.Session = session;
+            grab.Hud = hud;
+
             // The stage figure lives on its own layer; the operator's own
             // camera must not see it, or a second body appears in the room.
             if (head != null) head.cullingMask &= ~(1 << TeleopStage.StageLayer);

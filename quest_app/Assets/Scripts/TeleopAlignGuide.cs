@@ -52,7 +52,16 @@ namespace WeGo.Teleop
 
         private LineRenderer _leftRing, _rightRing, _leftLead, _rightLead;
         private LineRenderer _leftArrow, _rightArrow;
+        private LineRenderer _leftRingOutline, _rightRingOutline;
         private Material _material;
+
+        /// <summary>Dark, near-opaque. The passthrough backdrop behind these
+        /// rings is now a live camera image rather than a flat colour, so
+        /// Good/Warn/Bad can land on a same-toned patch of the real room and
+        /// nearly disappear. A dark outline drawn behind each ring, wider
+        /// than the ring itself, gives every colour contrast against
+        /// whatever is actually back there.</summary>
+        private static readonly Color Outline = new Color(0.02f, 0.02f, 0.03f, 0.9f);
 
         private void Start()
         {
@@ -71,6 +80,12 @@ namespace WeGo.Teleop
             }
             _material = new Material(shader);
 
+            // Outline built first so it lands behind the coloured ring in
+            // sibling order, though what actually keeps it behind is the
+            // backward depth offset in DrawRing -- sibling order is not a
+            // depth guarantee for opaque geometry in world space.
+            _leftRingOutline = MakeLine("AlignRingOutlineL", RingSegments + 1, RingWidth * 2.2f, true);
+            _rightRingOutline = MakeLine("AlignRingOutlineR", RingSegments + 1, RingWidth * 2.2f, true);
             _leftRing = MakeLine("AlignRingL", RingSegments + 1, RingWidth, true);
             _rightRing = MakeLine("AlignRingR", RingSegments + 1, RingWidth, true);
             _leftLead = MakeLine("AlignLeadL", 2, RingWidth * 0.6f, false);
@@ -112,10 +127,10 @@ namespace WeGo.Teleop
 
             DrawSide(Session.LeftAlignTarget, Session.LeftWristPosition, Session.LeftPosError,
                      Session.LeftInPosition, RadiusOr(Session.LeftRingRadius),
-                     _leftRing, _leftLead, _leftArrow);
+                     _leftRing, _leftRingOutline, _leftLead, _leftArrow);
             DrawSide(Session.RightAlignTarget, Session.RightWristPosition, Session.RightPosError,
                      Session.RightInPosition, RadiusOr(Session.RightRingRadius),
-                     _rightRing, _rightLead, _rightArrow);
+                     _rightRing, _rightRingOutline, _rightLead, _rightArrow);
         }
 
         /// <summary>Head pose from the session, for the same reason TeleopHud
@@ -138,7 +153,8 @@ namespace WeGo.Teleop
 
         private void DrawSide(Vector3 target, Vector3 wrist, float hostErr,
                               bool inPosition, float radius,
-                              LineRenderer ring, LineRenderer lead, LineRenderer arrow)
+                              LineRenderer ring, LineRenderer outline,
+                              LineRenderer lead, LineRenderer arrow)
         {
             // Distance is measured locally rather than taken from the host's
             // left_pos_err: the host's figure is one control cycle old and
@@ -157,11 +173,12 @@ namespace WeGo.Teleop
 
             var visible = IsInView(target);
             ring.enabled = visible;
+            outline.enabled = visible;
             arrow.enabled = !visible;
 
             if (visible)
             {
-                DrawRing(ring, target, colour, radius);
+                DrawRing(ring, outline, target, colour, radius);
                 var far = err > radius;
                 lead.enabled = far;
                 if (far)
@@ -187,23 +204,37 @@ namespace WeGo.Teleop
                             : Color.Lerp(Warn, Bad, (t - 0.5f) * 2f);
         }
 
+        /// <summary>Metres the outline sits behind the coloured ring, along
+        /// the same facing normal. Enough to clear ordinary Z-fighting at
+        /// these distances (rings are drawn 0.4-2m out) without visibly
+        /// detaching the outline from the ring it belongs to.</summary>
+        private const float OutlineDepthOffset = 0.004f;
+
         /// <summary>Ring drawn facing the operator, so it reads as a hoop to put
-        /// a hand through rather than an ellipse that happens to be edge-on.</summary>
-        private void DrawRing(LineRenderer lr, Vector3 centre, Color colour, float radius)
+        /// a hand through rather than an ellipse that happens to be edge-on.
+        /// Backed by a wider, dark outline ring set slightly behind it along
+        /// the same normal, so the coloured ring keeps contrast against
+        /// whatever the passthrough backdrop happens to show behind it.</summary>
+        private void DrawRing(LineRenderer lr, LineRenderer outline, Vector3 centre, Color colour, float radius)
         {
             var normal = (centre - HeadPos).normalized;
             if (normal.sqrMagnitude < 1e-6f) normal = Vector3.forward;
             var up = Mathf.Abs(Vector3.Dot(normal, Vector3.up)) > 0.95f ? Vector3.forward : Vector3.up;
             var a = Vector3.Normalize(Vector3.Cross(up, normal)) * radius;
             var b = Vector3.Normalize(Vector3.Cross(normal, a)) * radius;
+            var behind = centre - normal * OutlineDepthOffset;
 
             lr.positionCount = RingSegments + 1;
+            outline.positionCount = RingSegments + 1;
             for (var i = 0; i <= RingSegments; i++)
             {
                 var th = (float)i / RingSegments * Mathf.PI * 2f;
-                lr.SetPosition(i, centre + a * Mathf.Cos(th) + b * Mathf.Sin(th));
+                var offset = a * Mathf.Cos(th) + b * Mathf.Sin(th);
+                lr.SetPosition(i, centre + offset);
+                outline.SetPosition(i, behind + offset);
             }
             Tint(lr, colour, 1f);
+            outline.startColor = outline.endColor = Outline;
         }
 
         /// <summary>A chevron pinned inside the view edge, pointing the shortest
@@ -271,6 +302,7 @@ namespace WeGo.Teleop
         {
             if (_leftRing == null) return;
             _leftRing.enabled = on; _rightRing.enabled = on;
+            _leftRingOutline.enabled = on; _rightRingOutline.enabled = on;
             _leftLead.enabled = on; _rightLead.enabled = on;
             _leftArrow.enabled = on; _rightArrow.enabled = on;
         }

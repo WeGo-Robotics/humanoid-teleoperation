@@ -50,6 +50,26 @@ namespace WeGo.Teleop.Editor
             changed |= EnsureFeature(doc, manifest, "android.hardware.vr.headtracking",
                                      required: true, version: "1");
 
+            // OVRPassthroughLayer defaults to ProjectionSurfaceType.Reconstructed --
+            // automatic environment-depth reconstruction -- and that depth
+            // subsystem is gated behind the Scene runtime permission the same
+            // way EnvironmentDepthManager is. Without this declaration the OS
+            // compositor never even starts a passthrough client for the app:
+            // no failure, no pending state, just a background that stays on
+            // the fallback colour forever. See TeleopPassthrough.cs, which
+            // requests and waits on the runtime grant this permission enables.
+            changed |= EnsurePermission(doc, manifest, "com.oculus.permission.USE_SCENE");
+
+            // Meta XR Core SDK 85.0.0 introduced a separate runtime-gated
+            // permission for raw passthrough camera access on this Horizon OS
+            // generation (OVRPermissionsRequester.Permission
+            // .PassthroughCameraAccess). SDK 78.0.0 -- what this app targeted
+            // until 2026-08-25 -- had no such permission and never requested
+            // it, which is why passthrough silently sat at "not initialised,
+            // not pending, not failed" forever: the OS was refusing camera
+            // access the app never knew to ask for. See TeleopPassthrough.cs.
+            changed |= EnsurePermission(doc, manifest, "horizonos.permission.HEADSET_CAMERA");
+
             // Alignment happens in passthrough so the operator can see the real
             // robot they are matching against. Normally the Meta SDK emits this
             // from OVRProjectConfig while generating its own manifest, which we
@@ -70,7 +90,7 @@ namespace WeGo.Teleop.Editor
                 // a network problem rather than a policy one.
                 changed |= SetAttribute(application, "usesCleartextTraffic", "true");
                 changed |= EnsureMeta(doc, application, "com.oculus.supportedDevices",
-                                      "quest2|questpro|quest3");
+                                      "quest2|questpro|quest3|quest3s");
                 changed |= PatchActivities(doc, application);
             }
 
@@ -120,6 +140,17 @@ namespace WeGo.Teleop.Editor
                 return false;
             var e = doc.CreateElement("uses-permission");
             e.SetAttribute("name", AndroidNs, "android.permission.INTERNET");
+            manifest.AppendChild(e);
+            return true;
+        }
+
+        private static bool EnsurePermission(XmlDocument doc, XmlElement manifest, string permission)
+        {
+            if (manifest.SelectSingleNode($"uses-permission[@android:name='{permission}']",
+                                          NsManager(doc)) != null)
+                return false;
+            var e = doc.CreateElement("uses-permission");
+            e.SetAttribute("name", AndroidNs, permission);
             manifest.AppendChild(e);
             return true;
         }

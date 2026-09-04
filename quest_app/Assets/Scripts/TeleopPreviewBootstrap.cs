@@ -63,6 +63,13 @@ namespace WeGo.Teleop
             hud.Stage = stage;
             hud.Anchor = cam.transform;
 
+            // Same component the device build uses. The preview drives it from
+            // the synthetic controller poses, so the orbit limits and the
+            // collapse can be judged here rather than only in the headset.
+            var grab = host.AddComponent<TeleopHudGrab>();
+            grab.Session = session;
+            grab.Hud = hud;
+
             cam.cullingMask &= ~(1 << TeleopStage.StageLayer);
 
             var guide = host.AddComponent<TeleopAlignGuide>();
