@@ -38,6 +38,14 @@
 //   * Travel is clamped. Theirs is unbounded, which is fine for a settings
 //     panel and not fine for the display an operator reads to decide whether a
 //     humanoid is safe to drive. It cannot be put behind you.
+//
+// The clamps are measured against the rest position, not against the horizon,
+// and the rest position is not where it looks. TeleopHud hangs the console
+// from the horizon by an angle derived from the panel's own height, which
+// works out at 44 degrees down. So an up-limit has to clear 45 before the
+// operator can raise the console to eye level at all -- anything less reads
+// on device as "it only drags left, right and down", because that is exactly
+// what it does.
 
 using UnityEngine;
 
@@ -64,10 +72,11 @@ namespace WeGo.Teleop
                  "the operator.")]
         public float YawLimitDeg = 110f;
 
-        [Tooltip("Travel above the rest position. Small: the rest placement is " +
-                 "already hung off the horizon deliberately, and a console " +
-                 "over the eyeline is the thing that was being fixed.")]
-        public float PitchUpLimitDeg = 22f;
+        [Tooltip("Travel above the rest position. Has to be large, because the " +
+                 "rest position is a long way down: TeleopHud hangs the console " +
+                 "44 degrees below the horizon, so anything under about 45 here " +
+                 "means it can never actually be raised to eye level.")]
+        public float PitchUpLimitDeg = 55f;
 
         [Tooltip("Travel below the rest position, for pushing it down out of " +
                  "the way without collapsing it.")]
