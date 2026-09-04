@@ -142,11 +142,15 @@ if __name__ == '__main__':
                         help = 'Head-camera frames wider than this are scaled down '
                                'before being sent to the XR device')
     # start-alignment gate
-    parser.add_argument('--align-pos-tol', type = float, default = 0.10,
-                        help = 'Per-wrist position tolerance for the start-alignment gate (m)')
-    parser.add_argument('--align-rot-tol', type = float, default = 25.0,
+    parser.add_argument('--align-dir-tol', type = float, default = 30.0,
+                        help = 'Per-wrist direction tolerance for the start-alignment gate (deg). '
+                               'This is the one the default gate actually tests')
+    parser.add_argument('--align-pos-tol', type = float, default = 0.16,
+                        help = 'Per-wrist position tolerance for the start-alignment gate (m). '
+                               'Ignored unless the scale-free gate is turned off')
+    parser.add_argument('--align-rot-tol', type = float, default = 40.0,
                         help = 'Per-wrist orientation tolerance for the start-alignment gate (deg)')
-    parser.add_argument('--align-hold', type = float, default = 2.0,
+    parser.add_argument('--align-hold', type = float, default = 1.2,
                         help = 'Seconds the operator must hold the confirm gesture in position')
     parser.add_argument('--skip-align', action = 'store_true',
                         help = 'DANGEROUS. Skip the start-alignment gate; following begins '
@@ -181,7 +185,12 @@ if __name__ == '__main__':
 
     # Start-alignment gate: the operator's wrists must match the robot's own,
     # verified from robot state, before following can begin.
-    ALIGN = AlignGate(AlignConfig(pos_tol_m=args.align_pos_tol,
+    # dir_tol_deg was missing here, which meant --align-pos-tol was the only
+    # position-ish knob on the command line and it is the one the default
+    # scale-free gate never reads. Loosening the gate from the CLI therefore
+    # did nothing at all until this line passed the tolerance being tested.
+    ALIGN = AlignGate(AlignConfig(dir_tol_deg=args.align_dir_tol,
+                                  pos_tol_m=args.align_pos_tol,
                                   rot_tol_deg=args.align_rot_tol,
                                   hold_s=args.align_hold))
     if args.skip_align:

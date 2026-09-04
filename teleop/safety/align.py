@@ -84,13 +84,28 @@ from teleop.xr.transforms import WAIST_OFFSET_X, WAIST_OFFSET_Z
 
 @dataclass
 class AlignConfig:
-    pos_tol_m: float = 0.10        # per-wrist position tolerance
-    rot_tol_deg: float = 25.0      # per-wrist orientation tolerance
+    #: Per-wrist position tolerance. Read ONLY when `scale_free` is False --
+    #: the scale-free gate below tests `dir_tol_deg` and never looks at this.
+    #: Kept in step with the scale-free tolerances so switching paths does not
+    #: silently tighten the gate.
+    pos_tol_m: float = 0.16
+    rot_tol_deg: float = 40.0      # per-wrist orientation tolerance
     #: Gate on the direction of the head-to-wrist vector rather than on its
     #: endpoint, so an operator of any size passes by holding the right shape.
     #: See the module docstring; False restores the absolute-position gate.
     scale_free: bool = True
-    dir_tol_deg: float = 20.0      # per-wrist direction tolerance, scale-free
+    #: Per-wrist direction tolerance, and the tolerance that actually decides
+    #: the default gate.
+    #:
+    #: Raised from 20 after bench testing on 2026-09-04. The targets come from
+    #: the G1's own arm pose, and the robot is not shaped like the operator:
+    #: its wrists sit 29.7 cm apart where a human's are 40 cm or more. Holding
+    #: the same shape at a human's shoulder width is worth about 6.5 deg of
+    #: direction error at 40 cm of separation and 12.2 deg at 50 cm, before any
+    #: of the fore/aft and height difference that comes with not being a 1.34 m
+    #: robot. Twenty degrees left very little of that budget for the operator's
+    #: own aim.
+    dir_tol_deg: float = 30.0
     #: A hand this close to the head has no reliable direction -- normalising
     #: it would amplify tracking noise into large angles -- so it reads as
     #: out-of-tolerance rather than as a lucky pass.
@@ -109,7 +124,7 @@ class AlignConfig:
     #: crouches or sits, must not be able to fling the rings somewhere absurd.
     operator_scale_min: float = 0.75
     operator_scale_max: float = 1.80
-    hold_s: float = 2.0            # continuous agreement before accepting
+    hold_s: float = 1.2            # continuous agreement before accepting
     timeout_s: float = 120.0       # give up and return to idle
     guidance_range_m: float = 0.75  # informational only: distance at which the
                                      # HUD's closeness percentage reads 0%

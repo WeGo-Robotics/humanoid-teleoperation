@@ -198,7 +198,11 @@ class TestHoldResets(unittest.TestCase):
         self.assertTrue(resumed.accepted)
 
     def test_releasing_the_gesture_resets_the_hold(self):
-        rig = Rig()
+        # hold_s pinned, not inherited. This test needs 1.5 s to land in the
+        # MIDDLE of the hold, and it silently stopped doing that when the
+        # default dropped to 1.2 s -- at which point 1.5 s accepts the gate and
+        # the reset being tested never gets a chance to happen.
+        rig = Rig(AlignConfig(hold_s=2.0))
         rig.confirming = True
         rig.run(1.5)
         rig.confirming = False
