@@ -23,13 +23,27 @@ class MotionSwitcher:
         except Exception as e:
             return None, None
     
-    def Exit_Debug_Mode(self, retries=10, wait=0.5):
+    def Exit_Debug_Mode(self, retries=10, wait=0.5, max_wait=5.0):
         # SelectMode('ai') can return 7002 right after leaving debug even when it
         # takes effect a moment later; retry and judge success by CheckMode (not the
         # SelectMode return code). Symmetric with Enter_Debug_Mode's release loop.
         # Returns (ok, name): ok=True once the robot confirms 'ai' mode.
+        #
+        # `max_wait` is a wall-clock ceiling on top of `retries`, whichever is hit
+        # first ends the loop. This runs unconditionally in the shutdown path
+        # (teleop_hand_and_arm.py's finally block) on every exit from debug mode,
+        # including when the robot/sim has already disappeared -- e.g. the operator
+        # pressed [비상 정지] after losing the camera feed. Each SelectMode/CheckMode
+        # round trip can itself block for up to SetTimeout()'s 1.0s when the robot
+        # is unreachable, so 10 retries * ~2.5s (two RPCs plus `wait`) can cost
+        # ~25s with no operator-visible feedback -- a stop press that looks
+        # ignored. The deadline check runs between iterations, not inside one, so
+        # this bounds total wait to roughly max_wait plus one iteration's overshoot.
+        deadline = time.monotonic() + max_wait
         try:
             for _ in range(retries):
+                if time.monotonic() >= deadline:
+                    return False, None
                 self.msc.SelectMode(nameOrAlias='ai')
                 time.sleep(wait)
                 _, check = self.msc.CheckMode()

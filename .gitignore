@@ -13,3 +13,7 @@ teleop/utils/data/
 
 # OS
 .DS_Store
+
+# XrLink device telemetry recordings (teleop --xr-log)
+teleop/logs/
+*.jsonl
