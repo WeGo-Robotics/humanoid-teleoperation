@@ -472,6 +472,58 @@ if __name__ == '__main__':
         logger_mp.info("🟠  Press [e] for an emergency stop, [a] to acknowledge a safety fault.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
+
+        _vr_start_logged = [0.0]      # last diagnostic, monotonic
+
+        def _poll_vr_start(idle_frame):
+            """X+B held: start, or acknowledge a latched fault and start.
+
+            Called from BOTH idle loops -- the cold-start wait just below and
+            the main loop's paused/idle branch. There are two of them, they
+            look alike, and only one of them runs before the first start, so a
+            check written into one of them is a check the operator cannot
+            reach on a cold start. That is not hypothetical: it is how the
+            first version of this shipped.
+
+            The acknowledgement is explicit rather than folded into
+            SAFETY.arm(): clearing a latched fault is an operator decision and
+            it stays one. This changes who can express it, not what it means.
+            """
+            global START
+            if not args.vr_start:
+                return
+            now = time.monotonic()
+
+            # Whenever any face button is down, say what arrived and whether it
+            # reads as the gesture. Twice now a binding has been declared
+            # broken on the device when the fault was on this side, and the
+            # only way to tell those apart is to see what the host received.
+            if ((idle_frame.left_ctrl_aButton or idle_frame.left_ctrl_bButton
+                 or idle_frame.right_ctrl_aButton or idle_frame.right_ctrl_bButton)
+                    and now - _vr_start_logged[0] >= 1.0):
+                _vr_start_logged[0] = now
+                logger_mp.info(
+                    f"[vr-start] X={idle_frame.left_ctrl_aButton} "
+                    f"Y={idle_frame.left_ctrl_bButton} "
+                    f"A={idle_frame.right_ctrl_aButton} "
+                    f"B={idle_frame.right_ctrl_bButton} "
+                    f"gesture={start_gesture_held(idle_frame)} "
+                    f"held={START_COMBO.progress(now):.0%}")
+
+            if not START_COMBO.update(now, start_gesture_held(idle_frame)):
+                return
+            if SAFETY.latched:
+                if SAFETY.acknowledge(now):
+                    logger_mp.info("✅ safety fault acknowledged from the "
+                                   "headset (X+B)")
+                else:
+                    # Refused: say so rather than starting anyway.
+                    logger_mp.warning("⛔ headset ack refused — fault still "
+                                      "latched, not starting")
+            if not SAFETY.latched:
+                START = True
+                logger_mp.info("▶️  start requested from the headset (X+B)")
+
         # wait for start or stop signal. SHUTDOWN_REQUEST is in the condition
         # because a stop arriving while idle sets neither START nor STOP -- without
         # it this loop would spin forever and the request would look ignored.
@@ -483,6 +535,7 @@ if __name__ == '__main__':
             _idle = xr.read()
             SAFETY.update(time.monotonic(), _idle.liveness, _idle.head_pose,
                           _idle.left_wrist_pose, _idle.right_wrist_pose)
+            _poll_vr_start(_idle)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img, _ = img_client.get_head_frame()
                 xr.render_to_xr(head_img)
@@ -627,36 +680,9 @@ if __name__ == '__main__':
                               _idle.left_wrist_pose, _idle.right_wrist_pose)
 
                 # --- in-VR start / fault recovery -------------------------
-                # X+B held (Y and A up) closes the whole loop from inside the
-                # headset: start, and after a latched safe stop
-                # acknowledge-then-start, so a test session does not need a
-                # hand on the dashboard between runs. The binding dodges both
-                # Y+B (the device's e-stop) and X+A (the align skip), so an
-                # operator still holding it when alignment begins cannot
-                # trigger either -- see teleop/xr/combo.py.
-                #
-                # The acknowledgement is explicit here rather
-                # than folded into SAFETY.arm(): clearing a latched fault is
-                # an operator decision, and it stays one -- this changes who
-                # can express it, not what it means.
-                #
-                # Deliberately only in this branch: once START is set the
-                # loop takes the alignment path on the next iteration, and
-                # nothing there should be able to re-enter through here.
-                if args.vr_start and START_COMBO.update(time.monotonic(),
-                                                        start_gesture_held(_idle)):
-                    _now = time.monotonic()
-                    if SAFETY.latched:
-                        if SAFETY.acknowledge(_now):
-                            logger_mp.info("✅ safety fault acknowledged from the "
-                                           "headset (X+B)")
-                        else:
-                            # Refused: report it rather than starting anyway.
-                            logger_mp.warning("⛔ headset ack refused — fault still "
-                                              "latched, not starting")
-                    if not SAFETY.latched:
-                        START = True
-                        logger_mp.info("▶️  start requested from the headset (X+B)")
+                # Same gesture, same handler as the cold-start wait above.
+                _poll_vr_start(_idle)
+
                 # keep feeding the XR head image while paused
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                     head_img, _ = img_client.get_head_frame()
