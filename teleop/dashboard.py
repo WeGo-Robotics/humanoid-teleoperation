@@ -967,6 +967,7 @@ class Dashboard(QWidget):
         # long as this window is open; the operator should not have to re-pair
         # from inside the headset after every session.
         self._supervise = True       # cleared on window close so we stop respawning
+        self._running_arm = None     # --arm the live teleop process was spawned with
         self._respawn_timer = None   # pending QTimer for the next respawn
         self._term_requested = False # set by the SIGTERM/SIGINT/SIGHUP handler
         self._respawn_backoff = 0.0  # grows while the child keeps dying young
@@ -1158,14 +1159,32 @@ class Dashboard(QWidget):
         v.setSpacing(14)
         outer.addWidget(self.settings_body)
 
-        # 1) VR입력 : --input-mode  (controller | hand)
+        # 1) 로봇 : --arm  (which machine this session drives)
+        # A dropdown rather than a Segmented toggle: there are five arms and
+        # the list will grow, which is exactly what the network row already
+        # uses a combo for.
+        v.addWidget(self._caption("로봇"))
+        self.cmb_robot = QComboBox()
+        self.cmb_robot.setFixedHeight(34)
+        self.cmb_robot.setCursor(Qt.PointingHandCursor)
+        self.cmb_robot.setStyleSheet(self._combo_style())
+        for label, val in (("G1 (29 DoF)", "G1_29"), ("G1 (23 DoF)", "G1_23"),
+                           ("R1", "R1"), ("H1-2", "H1_2"), ("H1", "H1")):
+            self.cmb_robot.addItem(label, val)
+        _i = self.cmb_robot.findData(self.args.arm)
+        if _i >= 0:
+            self.cmb_robot.setCurrentIndex(_i)
+        self.cmb_robot.currentIndexChanged.connect(self._on_robot_changed)
+        v.addWidget(self.cmb_robot)
+
+        # 2) VR입력 : --input-mode  (controller | hand)
         v.addWidget(self._caption("VR입력"))
         self.set_inputmode = Segmented(
             [("컨트롤러", "controller"), ("손 추적", "hand")],
             index=(0 if self.args.input_mode != "hand" else 1))
         v.addWidget(self.set_inputmode)
 
-        # 2) 제어범위 : --motion  (상체=no motion / 전신=motion)
+        # 3) 제어범위 : --motion  (상체=no motion / 전신=motion)
         v.addWidget(self._caption("제어범위"))
         self.set_motion = Segmented(
             [("상체 (팔만)", False), ("전신 (이동)", True)],
@@ -1173,22 +1192,16 @@ class Dashboard(QWidget):
         self.set_motion.changed.connect(self._on_motion_changed)
         v.addWidget(self.set_motion)
 
-        # 3) 네트워크 : --network-interface  (dropdown of live ifaces)
+        # 4) 네트워크 : --network-interface  (dropdown of live ifaces)
         v.addWidget(self._caption("네트워크"))
         self.cmb_net = QComboBox()
         self.cmb_net.setFixedHeight(34)
         self.cmb_net.setCursor(Qt.PointingHandCursor)
-        self.cmb_net.setStyleSheet(
-            f"QComboBox{{background:{C['divider']};color:{C['text']};border:none;"
-            f"border-radius:8px;padding:0 12px;font-size:12px;font-weight:600;}}"
-            f"QComboBox::drop-down{{border:none;width:22px;}}"
-            f"QComboBox QAbstractItemView{{background:{C['card']};color:{C['text']};"
-            f"selection-background-color:{C['accent']};selection-color:#fff;"
-            f"border:1px solid {C['divider']};outline:none;}}")
+        self.cmb_net.setStyleSheet(self._combo_style())
         self._populate_net()
         v.addWidget(self.cmb_net)
 
-        # 4) 카메라서버 : --img-server-ip  (read-only + edit toggle)
+        # 5) 카메라서버 : --img-server-ip  (read-only + edit toggle)
         v.addWidget(self._caption("카메라서버"))
         camrow = QHBoxLayout()
         camrow.setSpacing(8)
@@ -1256,6 +1269,47 @@ class Dashboard(QWidget):
         show = not self.settings_body.isVisible()
         self.settings_body.setVisible(show)
         self._settings_chevron.setText("▾" if show else "▸")
+
+    def _selected_arm(self):
+        """The dropdown's arm, falling back to the CLI value."""
+        cmb = getattr(self, "cmb_robot", None)
+        return (cmb.currentData() if cmb is not None else None) or self.args.arm
+
+    @staticmethod
+    def _combo_style():
+        """Shared by the 로봇 and 네트워크 dropdowns so they cannot drift."""
+        return (f"QComboBox{{background:{C['divider']};color:{C['text']};border:none;"
+                f"border-radius:8px;padding:0 12px;font-size:12px;font-weight:600;}}"
+                f"QComboBox::drop-down{{border:none;width:22px;}}"
+                f"QComboBox QAbstractItemView{{background:{C['card']};color:{C['text']};"
+                f"selection-background-color:{C['accent']};selection-color:#fff;"
+                f"border:1px solid {C['divider']};outline:none;}}")
+
+    def _on_robot_changed(self):
+        """The arm is fixed when the teleop process starts, not per-command.
+
+        So the choice can only take effect on a fresh process. While teleop is
+        idle that is free -- stop it and let the supervisor respawn it with the
+        new command -- and while it is following it must not happen at all:
+        swapping the arm controller under a robot that is moving is not a
+        setting change, it is a different machine mid-reach.
+        """
+        arm = self.cmb_robot.currentData()
+        if self._phase in ("running", "paused"):
+            # Put it back: a control that silently means something other than
+            # what it displays is worse than one that refuses.
+            i = self.cmb_robot.findData(self._running_arm or self.args.arm)
+            if i >= 0:
+                self.cmb_robot.blockSignals(True)
+                self.cmb_robot.setCurrentIndex(i)
+                self.cmb_robot.blockSignals(False)
+            self._log("실행 중에는 로봇을 바꿀 수 없습니다 — 종료 후 변경하세요")
+            return
+        self._log(f"로봇 변경: {arm} — 텔레옵 재기동")
+        if self.proc and self.proc.poll() is None:
+            self._kill_proc_group(signal.SIGTERM)   # supervisor respawns it
+        else:
+            self._respawn_now()
 
     def _on_motion_changed(self):
         # selecting 전신(이동) on a real robot -> guide operator into walking mode.
@@ -1736,6 +1790,10 @@ class Dashboard(QWidget):
             self._schedule_respawn(rc="spawn-failed")
             return
         self._launch_time = time.monotonic()
+        # Remember what this process was actually started with. The dropdown
+        # can be changed while idle, so it is not a reliable record of what is
+        # running -- and reverting a refused change needs the truth.
+        self._running_arm = cmd[cmd.index("--arm") + 1] if "--arm" in cmd else None
         threading.Thread(target=self._pipe_proc_output, daemon=True).start()
         self._set_phase("starting")
         self._set_tag(False, "준비 중…")   # matches the disabled-buttons window
@@ -1828,7 +1886,7 @@ class Dashboard(QWidget):
                # recorded is a session that has to be run again.
                "--xr-log",
                "--input-mode", input_mode,
-               "--arm", a.arm,
+               "--arm", self._selected_arm(),
                "--img-server-ip", img_ip]
         if motion:
             cmd.append("--motion")
