@@ -305,6 +305,25 @@ class TestButtons(LinkFixture):
         self.assertFalse(frame.right_ctrl_thumbstick)
         self.assertFalse(frame.left_ctrl_aButton)
 
+    def test_all_four_face_buttons_reach_the_frame(self):
+        """The in-VR start gesture reads X+Y+A+B off the frame.
+
+        left_b/right_b were in BUTTON_NAMES and sent by the device from the
+        start, but native_source never copied them onto the frame, so the
+        fields existed, defaulted False, and silently could not be pressed.
+        A vocabulary entry that nothing forwards is worse than a missing one.
+        """
+        d = self.armed_device()
+        d.send_json(t="buttons",
+                    pressed=["left_a", "left_b", "right_a", "right_b"])
+        self.assertTrue(wait_until(lambda: self.source.read().left_ctrl_bButton))
+
+        frame = self.source.read()
+        self.assertTrue(frame.left_ctrl_aButton)
+        self.assertTrue(frame.left_ctrl_bButton)
+        self.assertTrue(frame.right_ctrl_aButton)
+        self.assertTrue(frame.right_ctrl_bButton)
+
     def test_release_clears_them(self):
         """Level-triggered: an empty set is how the device says 'released'."""
         d = self.armed_device()

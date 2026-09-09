@@ -53,6 +53,11 @@ class XRFrame:
     right_ctrl_triggerValue: float = 10.0
     left_ctrl_aButton: bool = False
     right_ctrl_aButton: bool = False
+    # Y and B. On the wire since the first protocol version and unread until
+    # the in-VR start gesture needed all four face buttons; see
+    # teleop/xr/combo.py.
+    left_ctrl_bButton: bool = False
+    right_ctrl_bButton: bool = False
     left_ctrl_thumbstick: bool = False
     right_ctrl_thumbstick: bool = False
     left_ctrl_thumbstickValue: np.ndarray = field(default_factory=_zeros2)

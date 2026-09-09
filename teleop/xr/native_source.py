@@ -99,6 +99,12 @@ class NativeXRSource(XRSource):
             right_ctrl_trigger=inputs.get("right_trigger_value", 10.0) < 1.0,
             left_ctrl_aButton="left_a" in buttons,
             right_ctrl_aButton="right_a" in buttons,
+            # Y and B were in the protocol vocabulary and on the device from
+            # the start, but never reached the frame, so nothing downstream
+            # could see them. The in-VR start gesture needs all four
+            # (teleop/xr/combo.py).
+            left_ctrl_bButton="left_b" in buttons,
+            right_ctrl_bButton="right_b" in buttons,
             left_ctrl_thumbstick="left_thumb" in buttons,
             right_ctrl_thumbstick="right_thumb" in buttons,
             left_ctrl_thumbstickValue=np.array(

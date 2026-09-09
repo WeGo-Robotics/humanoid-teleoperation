@@ -59,6 +59,11 @@ class VuerXRSource(XRSource):
             right_ctrl_triggerValue=float(data.right_ctrl_triggerValue),
             left_ctrl_aButton=bool(data.left_ctrl_aButton),
             right_ctrl_aButton=bool(data.right_ctrl_aButton),
+            # televuer has carried these all along; forwarding them keeps the
+            # in-VR start gesture working on the browser path too, rather than
+            # making it an XrLink-only feature.
+            left_ctrl_bButton=bool(data.left_ctrl_bButton),
+            right_ctrl_bButton=bool(data.right_ctrl_bButton),
             left_ctrl_thumbstick=bool(data.left_ctrl_thumbstick),
             right_ctrl_thumbstick=bool(data.right_ctrl_thumbstick),
             left_ctrl_thumbstickValue=np.asarray(data.left_ctrl_thumbstickValue),

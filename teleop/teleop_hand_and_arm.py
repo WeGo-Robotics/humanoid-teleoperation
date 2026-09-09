@@ -23,6 +23,7 @@ from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from teleop.safety import (Action, SafetyConfig, SafetyFSM, XRLiveness)
 from teleop.safety.align import AlignConfig, AlignGate
 from teleop.xr import XRFrame
+from teleop.xr.combo import HoldCombo, face_buttons_held
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -211,6 +212,13 @@ if __name__ == '__main__':
     parser.add_argument('--disable-xr-safety', action = 'store_true',
                         help = 'DANGEROUS. Bench/bringup only: run without the XR safety '
                                'gate, so losing the headset will NOT stop the robot.')
+    # in-VR start / fault recovery (teleop/xr/combo.py)
+    parser.add_argument('--vr-start-hold', type = float, default = 0.75,
+                        help = 'Seconds the operator must hold X+Y+A+B to start, or to '
+                               'acknowledge a latched fault and start again')
+    parser.add_argument('--no-vr-start', dest = 'vr_start', action = 'store_false',
+                        help = 'Require the dashboard/keyboard to start; ignore the '
+                               'X+Y+A+B controller gesture')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
@@ -246,6 +254,10 @@ if __name__ == '__main__':
                                   pos_tol_m=args.align_pos_tol,
                                   rot_tol_deg=args.align_rot_tol,
                                   hold_s=args.align_hold))
+    # The operator's own start button, on the controllers rather than on the
+    # host. Evaluated only while idle, so it cannot fire during alignment --
+    # where its four buttons include the X+A that waives the position check.
+    START_COMBO = HoldCombo(hold_s=args.vr_start_hold)
     if args.skip_align:
         logger_mp.error("=" * 70)
         logger_mp.error("⚠️  START-ALIGNMENT GATE SKIPPED (--skip-align)")
@@ -612,6 +624,33 @@ if __name__ == '__main__':
                 _idle = xr.read()
                 SAFETY.update(time.monotonic(), _idle.liveness, _idle.head_pose,
                               _idle.left_wrist_pose, _idle.right_wrist_pose)
+
+                # --- in-VR start / fault recovery -------------------------
+                # X+Y+A+B held closes the whole loop from inside the headset:
+                # start, and after a latched safe stop acknowledge-then-start,
+                # so a test session does not need a hand on the dashboard
+                # between runs. The acknowledgement is explicit here rather
+                # than folded into SAFETY.arm(): clearing a latched fault is
+                # an operator decision, and it stays one -- this changes who
+                # can express it, not what it means.
+                #
+                # Deliberately only in this branch. Once START is set the loop
+                # takes the alignment path on the next iteration, where these
+                # same buttons already mean "waive the position check".
+                if args.vr_start and START_COMBO.update(time.monotonic(),
+                                                        face_buttons_held(_idle)):
+                    _now = time.monotonic()
+                    if SAFETY.latched:
+                        if SAFETY.acknowledge(_now):
+                            logger_mp.info("✅ safety fault acknowledged from the "
+                                           "headset (X+Y+A+B)")
+                        else:
+                            # Refused: report it rather than starting anyway.
+                            logger_mp.warning("⛔ headset ack refused — fault still "
+                                              "latched, not starting")
+                    if not SAFETY.latched:
+                        START = True
+                        logger_mp.info("▶️  start requested from the headset (X+Y+A+B)")
                 # keep feeding the XR head image while paused
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                     head_img, _ = img_client.get_head_frame()
