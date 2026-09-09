@@ -225,7 +225,7 @@ BUTTON_NAMES = frozenset({
 
 
 HOST_MESSAGES = frozenset({
-    "state",         # {session, reason}
+    "state",         # {session, reason, robot}
     "prompt_align",  # {target:{left,right}, tol:{pos_m, rot_deg}}
     "abort",         # {reason}
     "video",         # {mode, url}

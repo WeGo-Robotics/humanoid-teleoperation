@@ -37,6 +37,14 @@ namespace WeGo.Teleop
 
         [Header("Read-only state for the UI")]
         public string SessionState = "DISCONNECTED";
+
+        /// <summary>Which machine the host is driving, as it names it on the
+        /// wire ("G1_29", "R1", ...). The stage shows the matching model.
+        ///
+        /// Defaults to the G1 rather than to nothing: an operator who sees no
+        /// robot cannot tell a missing model from a broken link, and every
+        /// session before this field existed was a G1.</summary>
+        public string Robot = "G1_29";
         public string AlignReason = "";
         public float AlignProgress;
         public bool IsWorn;
@@ -628,6 +636,11 @@ namespace WeGo.Teleop
                     switch (msg.t)
                     {
                         case "state":
+                            // Empty on a host that predates the field, which
+                            // is why this never clears an established name:
+                            // the stage would otherwise drop back to the
+                            // default model on the first old-format message.
+                            if (!string.IsNullOrEmpty(msg.robot)) Robot = msg.robot;
                             SessionState = msg.session ?? SessionState;
                             AlignReason = msg.reason ?? "";
                             AlignProgress = msg.align != null ? msg.align.progress : 0f;
@@ -715,7 +728,7 @@ namespace WeGo.Teleop
         }
         [Serializable] private class HostMessage
         {
-            public string t, session, reason;
+            public string t, session, reason, robot;
             public AlignPayload align;
         }
     }

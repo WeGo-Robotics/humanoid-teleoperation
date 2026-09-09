@@ -1,4 +1,4 @@
-// Bakes the vendored G1 URDF into a Unity prefab.
+// Bakes a vendored URDF into a Unity prefab.
 //
 // The stage used to draw a stick figure. That was never shippable, and the
 // right asset was already in the repository: assets/g1/g1_body29_hand14.urdf
@@ -12,9 +12,15 @@
 // is a few MB and loads instantly.
 //
 //   WeGo > Import G1 Model
+//   WeGo > Import R1 Model
 //
 // Re-run it only when the URDF or the meshes change. The output is committed
 // so a fresh clone can build without the import step.
+//
+// Nothing here is G1-specific -- it reads whatever URDF it is pointed at --
+// so a second robot costs one Robot entry and a re-run, not a second importer.
+// The app picks between the baked prefabs at runtime from what the host says
+// it is driving; see TeleopStage.
 //
 // Coordinate conversion: URDF is ROS convention -- z up, x forward, right
 // handed. Unity is y up, z forward, left handed. Positions map (x,y,z) ->
@@ -33,24 +39,64 @@ using UnityEngine;
 
 namespace WeGo.Teleop.Editor
 {
-    public static class G1ModelImporter
+    public static class RobotModelImporter
     {
-        private const string UrdfRelative = "../assets/g1/g1_body29_hand14.urdf";
-        private const string OutDir = "Assets/Resources/G1";
-        private const string PrefabPath = OutDir + "/G1Robot.prefab";
-        private const string MeshDir = OutDir + "/Meshes";
+        /// <summary>One robot the app can display. `Name` is both the
+        /// Resources folder and the name the host uses on the wire, so the
+        /// runtime lookup is Resources.Load($"{robot}/{robot}Robot") with no
+        /// table to keep in step.</summary>
+        private sealed class Robot
+        {
+            public string Name;
+            public string UrdfRelative;
+        }
+
+        private static readonly Robot G1 = new Robot
+        {
+            Name = "G1",
+            UrdfRelative = "../assets/g1/g1_body29_hand14.urdf",
+        };
+
+        private static readonly Robot R1 = new Robot
+        {
+            Name = "R1",
+            UrdfRelative = "../assets/r1/R1.urdf",
+        };
+
+        // Set per import so the mesh/material writers below need no extra
+        // plumbing. Not re-entrant, which is fine: this is a menu item.
+        private static string _outDir, _prefabPath, _meshDir, _tag;
 
         [MenuItem("WeGo/Import G1 Model")]
-        public static void Import()
+        public static void ImportG1() => Import(G1);
+
+        [MenuItem("WeGo/Import R1 Model")]
+        public static void ImportR1() => Import(R1);
+
+        /// <summary>Batchmode entry point, for `-executeMethod`.</summary>
+        public static void ImportAll()
         {
+            Import(G1);
+            Import(R1);
+        }
+
+        private static void Import(Robot robot)
+        {
+            _tag = $"{robot.Name}Import";
+            _outDir = $"Assets/Resources/{robot.Name}";
+            _prefabPath = $"{_outDir}/{robot.Name}Robot.prefab";
+            _meshDir = $"{_outDir}/Meshes";
+            // Materials are cached by colour against a path under _outDir, so
+            // a stale cache would hand the second robot the first one's assets.
+            Materials.Clear();
             try
             {
-                var urdfPath = Path.GetFullPath(UrdfRelative);
+                var urdfPath = Path.GetFullPath(robot.UrdfRelative);
                 if (!File.Exists(urdfPath))
                     throw new FileNotFoundException($"no URDF at {urdfPath}");
 
                 var root = Path.GetDirectoryName(urdfPath);
-                Directory.CreateDirectory(MeshDir);
+                Directory.CreateDirectory(_meshDir);
 
                 var doc = new XmlDocument();
                 doc.Load(urdfPath);
@@ -62,17 +108,17 @@ namespace WeGo.Teleop.Editor
                 var built = BuildHierarchy(links, joints, root);
                 if (built == null) throw new Exception("no root link; is the URDF a tree?");
 
-                Directory.CreateDirectory(OutDir);
-                PrefabUtility.SaveAsPrefabAsset(built, PrefabPath);
+                Directory.CreateDirectory(_outDir);
+                PrefabUtility.SaveAsPrefabAsset(built, _prefabPath);
                 UnityEngine.Object.DestroyImmediate(built);
 
                 AssetDatabase.SaveAssets();
                 AssetDatabase.Refresh();
-                Log($"wrote {PrefabPath}");
+                Log($"wrote {_prefabPath}");
             }
             catch (Exception e)
             {
-                Debug.LogError($"[G1Import] {e.GetType().Name}: {e.Message}\n{e.StackTrace}");
+                Debug.LogError($"[{_tag}] {e.GetType().Name}: {e.Message}\n{e.StackTrace}");
             }
         }
 
@@ -212,7 +258,7 @@ namespace WeGo.Teleop.Editor
             var path = Path.Combine(root, link.MeshFile.Replace("package://", ""));
             if (!File.Exists(path)) { Warn($"missing mesh {path}"); return; }
 
-            var assetPath = $"{MeshDir}/{Path.GetFileNameWithoutExtension(path)}.asset";
+            var assetPath = $"{_meshDir}/{Path.GetFileNameWithoutExtension(path)}.asset";
             var mesh = AssetDatabase.LoadAssetAtPath<Mesh>(assetPath);
             if (mesh == null)
             {
@@ -245,7 +291,7 @@ namespace WeGo.Teleop.Editor
             var key = ColorUtility.ToHtmlStringRGBA(c);
             if (Materials.TryGetValue(key, out var cached)) return cached;
 
-            var path = $"{OutDir}/Mat_{key}.mat";
+            var path = $"{_outDir}/Mat_{key}.mat";
             var mat = AssetDatabase.LoadAssetAtPath<Material>(path);
             if (mat == null)
             {
@@ -319,7 +365,7 @@ namespace WeGo.Teleop.Editor
                                   out var v) ? v : 0f;
         }
 
-        private static void Log(string m) => Debug.Log($"[G1Import] {m}");
-        private static void Warn(string m) => Debug.LogWarning($"[G1Import] {m}");
+        private static void Log(string m) => Debug.Log($"[{_tag}] {m}");
+        private static void Warn(string m) => Debug.LogWarning($"[{_tag}] {m}");
     }
 }

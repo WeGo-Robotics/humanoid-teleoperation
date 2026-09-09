@@ -176,6 +176,16 @@ class TestControlChannel(unittest.TestCase):
         self.assertEqual(msg["t"], "prompt_align")
         self.assertEqual(msg["tol"]["pos_m"], 0.08)
 
+    def test_state_carries_the_robot_it_is_driving(self):
+        """The device picks its 3D model from this.
+
+        It rides on every state message rather than a handshake so a headset
+        that connects late still learns what it is looking at.
+        """
+        msg = json.loads(encode_control("state", session="IDLE", reason="",
+                                        robot="R1"))
+        self.assertEqual(msg["robot"], "R1")
+
     def test_host_cannot_send_a_device_message(self):
         with self.assertRaises(CodecError):
             encode_control("presence", worn=True)

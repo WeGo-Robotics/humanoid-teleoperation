@@ -595,7 +595,14 @@ if __name__ == '__main__':
             if key == _last_state_key and (now - _last_state_push) < min_interval:
                 return
             _last_state_push, _last_state_key = now, key
-            msg = {"t": "state", "session": session, "reason": reason}
+            # `robot` rides on every state message rather than only the
+            # first. It costs a short string on a channel that is already
+            # sending this line, and it means a headset that connects or
+            # reconnects mid-session learns which machine it is looking at
+            # without a handshake to miss. The device shows the matching
+            # model; an app that does not know the name keeps its default.
+            msg = {"t": "state", "session": session, "reason": reason,
+                   "robot": args.arm}
             if align is not None:
                 msg["align"] = align
             xr.send(msg)

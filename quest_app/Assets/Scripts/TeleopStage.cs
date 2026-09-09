@@ -46,6 +46,10 @@ namespace WeGo.Teleop
         private Camera _camera;
         private Material _material;
         private Transform _robot;
+        //: Family currently instantiated, so the model is rebuilt only when
+        //: the host says something different -- the robot name rides on every
+        //: state message, not just the first.
+        private string _builtFamily;
 
         private LineRenderer _leftRing, _rightRing, _leftHand, _rightHand;
         private const int Segments = 28;
@@ -95,19 +99,52 @@ namespace WeGo.Teleop
             _rightHand = Line("SHandR", 0.011f);
         }
 
+        /// <summary>Model family for a host arm name.
+        ///
+        /// The host names the controller ("G1_29", "G1_23", "R1"); the prefabs
+        /// are per machine ("G1", "R1"), because a 23-DoF G1 and a 29-DoF G1
+        /// are the same robot to look at. Prefix rather than a lookup table so
+        /// a new variant of a robot we already ship needs no change here.</summary>
+        private static string Family(string arm)
+        {
+            if (string.IsNullOrEmpty(arm)) return DefaultFamily;
+            if (arm.StartsWith("R1")) return "R1";
+            if (arm.StartsWith("G1")) return "G1";
+            return DefaultFamily;
+        }
+
+        private const string DefaultFamily = "G1";
+
         private void BuildModel()
         {
-            var prefab = Resources.Load<GameObject>("G1/G1Robot");
+            var family = Family(Session != null ? Session.Robot : null);
+            if (family == _builtFamily) return;
+
+            var prefab = Resources.Load<GameObject>($"{family}/{family}Robot");
             if (prefab == null)
             {
-                Debug.LogError("[Teleop] no Resources/G1/G1Robot. Run " +
-                               "WeGo > Import G1 Model; the stage will be empty.");
-                return;
+                // Falling back rather than standing empty: the model is the
+                // operator's sense of which way the robot faces, and an empty
+                // stage reads as a broken link rather than a missing asset.
+                // Loud, because a G1 shown while driving an R1 is misleading.
+                Debug.LogError($"[Teleop] no Resources/{family}/{family}Robot — " +
+                               $"run WeGo > Import {family} Model. Showing the " +
+                               $"{DefaultFamily} instead.");
+                family = DefaultFamily;
+                prefab = Resources.Load<GameObject>($"{family}/{family}Robot");
+                if (prefab == null)
+                {
+                    Debug.LogError("[Teleop] no robot model at all; stage is empty.");
+                    return;
+                }
             }
 
+            if (_robot != null) Destroy(_robot.gameObject);
+
             var go = Instantiate(prefab, StageOrigin, Quaternion.identity, transform);
-            go.name = "G1";
+            go.name = family;
             _robot = go.transform;
+            _builtFamily = family;
             SetLayer(_robot, StageLayer);
 
             // No pose is applied. The prefab carries the URDF's own rest
@@ -202,6 +239,11 @@ namespace WeGo.Teleop
         private void LateUpdate()
         {
             if (Session == null || _camera == null) return;
+
+            // Cheap: a string compare against what is already built, and the
+            // host tells us on every state message rather than once at
+            // connect, so a headset that joins mid-session still gets it.
+            BuildModel();
 
             var headPos = Session.HeadPosition;
             var anchor = StageOrigin + WaistOffset;

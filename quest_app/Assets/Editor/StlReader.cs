@@ -139,9 +139,9 @@ namespace WeGo.Teleop.Editor
                 // Reversed winding. The ROS->Unity basis change has determinant
                 // -1, so preserving STL's order would leave every surface
                 // facing inward.
-                _indices.Add(Index(G1ModelImporter.RosToUnity(c)));
-                _indices.Add(Index(G1ModelImporter.RosToUnity(b)));
-                _indices.Add(Index(G1ModelImporter.RosToUnity(a)));
+                _indices.Add(Index(RobotModelImporter.RosToUnity(c)));
+                _indices.Add(Index(RobotModelImporter.RosToUnity(b)));
+                _indices.Add(Index(RobotModelImporter.RosToUnity(a)));
             }
 
             /// <summary>Welds on a 0.1 mm lattice. The G1's meshes are modelled
