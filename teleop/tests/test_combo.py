@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from xr.combo import HoldCombo, face_buttons_held  # noqa: E402
+from xr.combo import HoldCombo, start_gesture_held  # noqa: E402
 
 
 class Frame:
@@ -23,23 +23,31 @@ class Frame:
         self.right_ctrl_bButton = rb
 
 
-class FaceButtonsHeldTest(unittest.TestCase):
+class StartGestureHeldTest(unittest.TestCase):
 
-    def test_all_four_is_the_gesture(self):
-        self.assertTrue(face_buttons_held(Frame(True, True, True, True)))
+    def test_x_and_a_with_y_and_b_up_is_the_gesture(self):
+        self.assertTrue(start_gesture_held(Frame(la=True, ra=True)))
 
-    def test_any_one_missing_is_not(self):
-        # Each of the four is load-bearing; three buttons must never start a
-        # robot, and X+A on its own already means "waive the align position
-        # check" during alignment.
-        for missing in range(4):
-            flags = [True, True, True, True]
-            flags[missing] = False
-            with self.subTest(missing=missing):
-                self.assertFalse(face_buttons_held(Frame(*flags)))
+    def test_one_hand_alone_is_not(self):
+        # One button that arms a humanoid is a button someone leans on.
+        self.assertFalse(start_gesture_held(Frame(la=True)))
+        self.assertFalse(start_gesture_held(Frame(ra=True)))
 
     def test_nothing_held_is_not(self):
-        self.assertFalse(face_buttons_held(Frame()))
+        self.assertFalse(start_gesture_held(Frame()))
+
+    def test_all_four_is_not_a_start(self):
+        """Y+B is the device's e-stop, so mashing everything must not start.
+
+        The device fires its own estop message in this case; the point of
+        testing it here is that the host agrees rather than racing it.
+        """
+        self.assertFalse(start_gesture_held(
+            Frame(la=True, lb=True, ra=True, rb=True)))
+
+    def test_either_secondary_button_alone_blocks_it(self):
+        self.assertFalse(start_gesture_held(Frame(la=True, ra=True, lb=True)))
+        self.assertFalse(start_gesture_held(Frame(la=True, ra=True, rb=True)))
 
 
 class HoldComboTest(unittest.TestCase):

@@ -10,16 +10,24 @@ a demo and wrong for a test session, where the interesting run is the tenth
 recovery rather than the first, and where taking the headset off to reach a
 keyboard is itself a way to lose the state you were trying to reproduce.
 
-So the four face buttons -- X and Y on the left pad, A and B on the right --
-mean "start", and when a stop is latched they mean "acknowledge, then start".
+So the two primary face buttons -- X on the left pad, A on the right -- mean
+"start", and when a stop is latched they mean "acknowledge, then start".
+
+It was meant to be all four. It cannot be: the Quest app binds Y + B to the
+emergency stop (TeleopSession.EstopBinding), and that fires on the device and
+travels as its own `estop` message, so any gesture containing Y and B is an
+e-stop before it is anything else. X + A is the complement, and the one pair
+on these pads with no other meaning while the session is idle.
 
 Three decisions worth keeping:
 
-  * All four, not one. Every other button on these pads already means
-    something: X+A waives the align position check, the thumbstick clicks damp
-    the robot. A single button that arms a humanoid is a button someone will
-    lean on. Four across two hands cannot be pressed by accident, and cannot
-    be pressed at all while the operator is holding anything.
+  * Two hands, and Y+B explicitly *up*. One button that arms a humanoid is a
+    button someone will lean on; two, one per hand, cannot be pressed while
+    the operator is holding anything. Requiring Y and B released is not
+    decoration -- it means an operator mashing all four gets the e-stop and
+    unambiguously not a start, which is the right way round for that race.
+    (X+A also waives the align position check, but only during alignment, and
+    this gesture is read only while idle.)
 
   * Held, not tapped. A tap is what a dropped controller produces; a hold is a
     decision. `hold_s` is the whole safety margin here, so it is a constant
@@ -42,15 +50,20 @@ from __future__ import annotations
 from typing import Optional
 
 
-def face_buttons_held(frame) -> bool:
-    """X + Y + A + B, held together across both controllers.
+def start_gesture_held(frame) -> bool:
+    """X + A held, with Y and B released.
+
+    The negative half matters as much as the positive one: Y+B is the device's
+    emergency stop, so an operator pressing all four must get a stop and never
+    a start. Testing all four fields rather than two makes that explicit here
+    instead of leaving it to whichever message happens to arrive first.
 
     Reads the device-neutral frame, so this works on the XrLink path and the
-    Vuer path alike -- both populate these four fields (see
-    teleop/xr/native_source.py and televuer's tv_wrapper).
+    Vuer path alike (see teleop/xr/native_source.py and vuer_source.py).
     """
-    return bool(frame.left_ctrl_aButton and frame.left_ctrl_bButton
-                and frame.right_ctrl_aButton and frame.right_ctrl_bButton)
+    return bool(frame.left_ctrl_aButton and frame.right_ctrl_aButton
+                and not frame.left_ctrl_bButton
+                and not frame.right_ctrl_bButton)
 
 
 class HoldCombo:
