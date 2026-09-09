@@ -1649,6 +1649,11 @@ class Dashboard(QWidget):
 
     # --- logging ------------------------------------------------------------
     def _log(self, text):
+        # Also to stdout, which under systemd/journald is the only copy that
+        # survives. Everything the teleop child prints arrives here and
+        # nowhere else, so when it died mid-session the reason died with the
+        # window -- twice, before this line existed.
+        print(text, flush=True)
         self._log_lines.insert(0, f'<span style="color:{C["neutral700"]};'
                                   f'font-family:monospace">{now_str()}</span>&nbsp;&nbsp;{text}')
         self._log_lines = self._log_lines[:200]
