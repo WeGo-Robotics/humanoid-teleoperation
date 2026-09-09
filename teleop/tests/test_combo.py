@@ -25,29 +25,43 @@ class Frame:
 
 class StartGestureHeldTest(unittest.TestCase):
 
-    def test_x_and_a_with_y_and_b_up_is_the_gesture(self):
-        self.assertTrue(start_gesture_held(Frame(la=True, ra=True)))
+    def test_x_and_b_with_y_and_a_up_is_the_gesture(self):
+        self.assertTrue(start_gesture_held(Frame(la=True, rb=True)))
 
     def test_one_hand_alone_is_not(self):
         # One button that arms a humanoid is a button someone leans on.
         self.assertFalse(start_gesture_held(Frame(la=True)))
-        self.assertFalse(start_gesture_held(Frame(ra=True)))
+        self.assertFalse(start_gesture_held(Frame(rb=True)))
 
     def test_nothing_held_is_not(self):
         self.assertFalse(start_gesture_held(Frame()))
 
-    def test_all_four_is_not_a_start(self):
-        """Y+B is the device's e-stop, so mashing everything must not start.
-
-        The device fires its own estop message in this case; the point of
-        testing it here is that the host agrees rather than racing it.
-        """
+    def test_the_estop_pair_is_not_a_start(self):
+        """Y+B stops the robot on the device. The host must not read a start
+        out of it, whichever message arrives first."""
+        self.assertFalse(start_gesture_held(Frame(lb=True, rb=True)))
         self.assertFalse(start_gesture_held(
             Frame(la=True, lb=True, ra=True, rb=True)))
 
-    def test_either_secondary_button_alone_blocks_it(self):
-        self.assertFalse(start_gesture_held(Frame(la=True, ra=True, lb=True)))
-        self.assertFalse(start_gesture_held(Frame(la=True, ra=True, rb=True)))
+    def test_the_align_skip_pair_is_not_a_start(self):
+        """X+A waives the align position check.
+
+        These must stay disjoint: an operator who holds the start gesture into
+        alignment and then pulls both triggers would otherwise skip the very
+        check the start was for.
+        """
+        self.assertFalse(start_gesture_held(Frame(la=True, ra=True)))
+
+    def test_holding_the_start_gesture_is_not_the_skip_gesture(self):
+        """The converse, stated as the invariant it is."""
+        held = Frame(la=True, rb=True)
+        self.assertTrue(start_gesture_held(held))
+        skip = held.left_ctrl_aButton and held.right_ctrl_aButton
+        self.assertFalse(skip)
+
+    def test_adding_either_excluded_button_blocks_it(self):
+        self.assertFalse(start_gesture_held(Frame(la=True, rb=True, lb=True)))
+        self.assertFalse(start_gesture_held(Frame(la=True, rb=True, ra=True)))
 
 
 class HoldComboTest(unittest.TestCase):

@@ -214,12 +214,12 @@ if __name__ == '__main__':
                                'gate, so losing the headset will NOT stop the robot.')
     # in-VR start / fault recovery (teleop/xr/combo.py)
     parser.add_argument('--vr-start-hold', type = float, default = 1.0,
-                        help = 'Seconds the operator must hold X+A (with Y+B released) '
-                               'to start, or to acknowledge a latched fault and start '
-                               'again')
+                        help = 'Seconds the operator must hold X+B (with Y and A '
+                               'released) to start, or to acknowledge a latched fault '
+                               'and start again')
     parser.add_argument('--no-vr-start', dest = 'vr_start', action = 'store_false',
                         help = 'Require the dashboard/keyboard to start; ignore the '
-                               'X+A controller gesture')
+                               'X+B controller gesture')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
@@ -256,8 +256,8 @@ if __name__ == '__main__':
                                   rot_tol_deg=args.align_rot_tol,
                                   hold_s=args.align_hold))
     # The operator's own start button, on the controllers rather than on the
-    # host. Evaluated only while idle, so it cannot fire during alignment,
-    # where X+A already means "waive the position check".
+    # host. X+B rather than anything more obvious because every other pair on
+    # these pads is already spoken for; teleop/xr/combo.py has the map.
     START_COMBO = HoldCombo(hold_s=args.vr_start_hold)
     if args.skip_align:
         logger_mp.error("=" * 70)
@@ -627,35 +627,36 @@ if __name__ == '__main__':
                               _idle.left_wrist_pose, _idle.right_wrist_pose)
 
                 # --- in-VR start / fault recovery -------------------------
-                # X+A held (Y+B up) closes the whole loop from inside the
+                # X+B held (Y and A up) closes the whole loop from inside the
                 # headset: start, and after a latched safe stop
                 # acknowledge-then-start, so a test session does not need a
-                # hand on the dashboard between runs. Y+B is the device's own
-                # e-stop, which is why the gesture requires them released --
-                # see teleop/xr/combo.py.
+                # hand on the dashboard between runs. The binding dodges both
+                # Y+B (the device's e-stop) and X+A (the align skip), so an
+                # operator still holding it when alignment begins cannot
+                # trigger either -- see teleop/xr/combo.py.
                 #
                 # The acknowledgement is explicit here rather
                 # than folded into SAFETY.arm(): clearing a latched fault is
                 # an operator decision, and it stays one -- this changes who
                 # can express it, not what it means.
                 #
-                # Deliberately only in this branch. Once START is set the loop
-                # takes the alignment path on the next iteration, where these
-                # same buttons already mean "waive the position check".
+                # Deliberately only in this branch: once START is set the
+                # loop takes the alignment path on the next iteration, and
+                # nothing there should be able to re-enter through here.
                 if args.vr_start and START_COMBO.update(time.monotonic(),
                                                         start_gesture_held(_idle)):
                     _now = time.monotonic()
                     if SAFETY.latched:
                         if SAFETY.acknowledge(_now):
                             logger_mp.info("✅ safety fault acknowledged from the "
-                                           "headset (X+A)")
+                                           "headset (X+B)")
                         else:
                             # Refused: report it rather than starting anyway.
                             logger_mp.warning("⛔ headset ack refused — fault still "
                                               "latched, not starting")
                     if not SAFETY.latched:
                         START = True
-                        logger_mp.info("▶️  start requested from the headset (X+A)")
+                        logger_mp.info("▶️  start requested from the headset (X+B)")
                 # keep feeding the XR head image while paused
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                     head_img, _ = img_client.get_head_frame()

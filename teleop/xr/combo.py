@@ -10,24 +10,37 @@ a demo and wrong for a test session, where the interesting run is the tenth
 recovery rather than the first, and where taking the headset off to reach a
 keyboard is itself a way to lose the state you were trying to reproduce.
 
-So the two primary face buttons -- X on the left pad, A on the right -- mean
-"start", and when a stop is latched they mean "acknowledge, then start".
+So X on the left pad and B on the right mean "start", and when a stop is
+latched they mean "acknowledge, then start".
 
-It was meant to be all four. It cannot be: the Quest app binds Y + B to the
-emergency stop (TeleopSession.EstopBinding), and that fires on the device and
-travels as its own `estop` message, so any gesture containing Y and B is an
-e-stop before it is anything else. X + A is the complement, and the one pair
-on these pads with no other meaning while the session is idle.
+That pairing looks arbitrary and is not. Everything else on these controllers
+is spoken for, and two of the obvious choices are actively wrong:
+
+    Y + B                 emergency stop      (app, TeleopSession.EstopBinding)
+    X + A                 waive the align position check   (host)
+    both thumbstick clicks  damp the robot    (host, motion mode)
+    both grips            move/collapse the console        (app)
+    both triggers         align confirm       (host)
+
+All four face buttons was the first attempt: it contains Y+B, so it stopped
+the robot instead of starting it -- the device fires that locally and sends
+its own `estop` message, which no host-side hold detector can get in front of.
+
+X+A was the second: it is free while idle, but an operator who holds it to
+start and does not let go is still holding it a moment later when they pull
+both triggers to align -- which is exactly the skip gesture. The gesture used
+to start would have quietly waived the check it started.
+
+X+B is a subset of neither, so holding it through alignment satisfies neither.
 
 Three decisions worth keeping:
 
-  * Two hands, and Y+B explicitly *up*. One button that arms a humanoid is a
-    button someone will lean on; two, one per hand, cannot be pressed while
-    the operator is holding anything. Requiring Y and B released is not
-    decoration -- it means an operator mashing all four gets the e-stop and
-    unambiguously not a start, which is the right way round for that race.
-    (X+A also waives the align position check, but only during alignment, and
-    this gesture is read only while idle.)
+  * Two hands, and the other two buttons explicitly *up*. One button that
+    arms a humanoid is a button someone will lean on; two, one per hand,
+    cannot be pressed while the operator is holding anything. Requiring Y and
+    A released is not decoration: it means an operator mashing everything gets
+    the e-stop and unambiguously not a start, decided here rather than by
+    whichever message happens to arrive first.
 
   * Held, not tapped. A tap is what a dropped controller produces; a hold is a
     decision. `hold_s` is the whole safety margin here, so it is a constant
@@ -51,19 +64,19 @@ from typing import Optional
 
 
 def start_gesture_held(frame) -> bool:
-    """X + A held, with Y and B released.
+    """X (left primary) + B (right secondary), with Y and A released.
 
-    The negative half matters as much as the positive one: Y+B is the device's
-    emergency stop, so an operator pressing all four must get a stop and never
-    a start. Testing all four fields rather than two makes that explicit here
-    instead of leaving it to whichever message happens to arrive first.
+    The negative half matters as much as the positive one. Y+B is the device's
+    emergency stop and X+A waives the align position check; requiring their
+    other halves released means this gesture can never be read out of a press
+    that was meant as either of those.
 
     Reads the device-neutral frame, so this works on the XrLink path and the
     Vuer path alike (see teleop/xr/native_source.py and vuer_source.py).
     """
-    return bool(frame.left_ctrl_aButton and frame.right_ctrl_aButton
+    return bool(frame.left_ctrl_aButton and frame.right_ctrl_bButton
                 and not frame.left_ctrl_bButton
-                and not frame.right_ctrl_bButton)
+                and not frame.right_ctrl_aButton)
 
 
 class HoldCombo:
