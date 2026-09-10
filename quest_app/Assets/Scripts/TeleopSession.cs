@@ -38,13 +38,25 @@ namespace WeGo.Teleop
         [Header("Read-only state for the UI")]
         public string SessionState = "DISCONNECTED";
 
-        /// <summary>Which machine the host is driving, as it names it on the
-        /// wire ("G1_29", "R1", ...). The stage shows the matching model.
+        /// <summary>Which robot this app was built for ("G1", "R1"). Fixed
+        /// at build time: G1 and R1 are separate apps, and the model on the
+        /// stage never changes under the operator.</summary>
+        public string AppRobot = "G1";
+
+        /// <summary>Which machine the host says it is driving, as it names it
+        /// on the wire ("G1_29", "R1", ...). Empty until the first state
+        /// message, and from a host that predates the field.
         ///
-        /// Defaults to the G1 rather than to nothing: an operator who sees no
-        /// robot cannot tell a missing model from a broken link, and every
-        /// session before this field existed was a G1.</summary>
-        public string Robot = "G1_29";
+        /// Not used to choose the model -- AppRobot does that. It exists so a
+        /// G1 app pointed at an R1 host, or the reverse, says so instead of
+        /// quietly showing the operator the wrong machine to align to.</summary>
+        public string Robot = "";
+
+        /// <summary>True when the host has named a robot and it is not the one
+        /// this app is for.</summary>
+        public bool RobotMismatch =>
+            !string.IsNullOrEmpty(Robot) &&
+            !Robot.StartsWith(AppRobot, StringComparison.OrdinalIgnoreCase);
         public string AlignReason = "";
         public float AlignProgress;
         public bool IsWorn;

@@ -32,8 +32,15 @@ namespace WeGo.Teleop.Editor
     public static class QuestBuild
     {
         private const string ScenePath = "Assets/Scenes/Teleop.unity";
-        private const string DefaultApk = "Build/G1Teleop.apk";
-        private const string PackageId = "com.wegorobotics.g1teleop";
+        // Per robot. G1 and R1 are separate apps -- own package id, own name
+        // in the headset's library, own APK -- so both can be installed side
+        // by side and an operator picks the robot by picking the app.
+        // The G1 values are the ones every earlier build used, so an existing
+        // G1 install upgrades in place instead of appearing twice.
+        private static string PackageId(string robot) => $"com.wegorobotics.{robot.ToLowerInvariant()}teleop";
+        private static string ProductName(string robot) => $"{robot} Teleop";
+        private static string DefaultApk(string robot) => $"Build/{robot}Teleop.apk";
+        private static readonly string[] Robots = { "G1", "R1" };
         private const string OculusLoader = "Unity.XR.Oculus.OculusLoader";
 
         // Quest 3 runs Android 12L. Meta requires target 32 or newer for
@@ -49,9 +56,11 @@ namespace WeGo.Teleop.Editor
         // ------------------------------------------------------------------
         private static void Run(Options opt)
         {
+            // The menu path builds Options directly, without FromCommandLine.
+            opt.Output = opt.Output ?? Path.GetFullPath(DefaultApk(opt.Robot));
             try
             {
-                Log($"host={opt.Host}:{opt.Port} tls={opt.UseTls} " +
+                Log($"robot={opt.Robot} host={opt.Host}:{opt.Port} tls={opt.UseTls} " +
                     $"output={opt.Output} development={opt.Development}");
 
                 SwitchToAndroid();
@@ -106,8 +115,8 @@ namespace WeGo.Teleop.Editor
             var android = NamedBuildTarget.Android;
 
             PlayerSettings.companyName = "WeGo Robotics";
-            PlayerSettings.productName = "G1 Teleop";
-            PlayerSettings.SetApplicationIdentifier(android, PackageId);
+            PlayerSettings.productName = ProductName(opt.Robot);
+            PlayerSettings.SetApplicationIdentifier(android, PackageId(opt.Robot));
             PlayerSettings.bundleVersion = "0.1.0";
             PlayerSettings.Android.bundleVersionCode = opt.VersionCode;
 
@@ -382,11 +391,12 @@ namespace WeGo.Teleop.Editor
             boot.HostAddress = opt.Host;
             boot.Port = opt.Port;
             boot.UseTls = opt.UseTls;
+            boot.Robot = opt.Robot;
 
             Directory.CreateDirectory("Assets/Scenes");
             if (!EditorSceneManager.SaveScene(scene, ScenePath))
                 throw new Exception($"could not save {ScenePath}");
-            Log($"generated {ScenePath} for {boot.HostAddress}:{boot.Port}");
+            Log($"generated {ScenePath} for {boot.Robot} at {boot.HostAddress}:{boot.Port}");
         }
 
         // ------------------------------------------------------------------
@@ -395,7 +405,8 @@ namespace WeGo.Teleop.Editor
             public string Host = "192.168.123.2";
             public int Port = 8443;
             public bool UseTls = false;
-            public string Output = DefaultApk;
+            public string Robot = "G1";
+            public string Output;
             public bool Development;
             public int VersionCode = 1;
             public bool BatchMode = Application.isBatchMode;
@@ -411,12 +422,16 @@ namespace WeGo.Teleop.Editor
                         case "-host": o.Host = Next(args, i); break;
                         case "-port": o.Port = int.Parse(Next(args, i)); break;
                         case "-output": o.Output = Next(args, i); break;
+                        case "-robot": o.Robot = Next(args, i).ToUpperInvariant(); break;
                         case "-versionCode": o.VersionCode = int.Parse(Next(args, i)); break;
                         case "-tls": o.UseTls = true; break;
                         case "-development": o.Development = true; break;
                     }
                 }
-                o.Output = Path.GetFullPath(o.Output);
+                if (Array.IndexOf(Robots, o.Robot) < 0)
+                    throw new ArgumentException(
+                        $"-robot {o.Robot}: expected one of {string.Join(", ", Robots)}");
+                o.Output = Path.GetFullPath(o.Output ?? DefaultApk(o.Robot));
                 Directory.CreateDirectory(Path.GetDirectoryName(o.Output) ?? ".");
                 return o;
             }

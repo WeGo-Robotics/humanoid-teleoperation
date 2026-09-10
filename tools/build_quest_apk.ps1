@@ -12,6 +12,12 @@
     compiles IL2CPP for ARM64 -- expect 10-20 minutes and a network connection.
     Later builds reuse Library/ and take a couple of minutes.
 
+.PARAMETER Robot
+    G1 or R1. Each robot is its own app -- own package id, own entry in the
+    headset's library, own APK (Build/G1Teleop.apk, Build/R1Teleop.apk) -- so
+    both can be installed at once and the operator picks the robot by picking
+    the app.
+
 .PARAMETER HostAddress
     The Host PC running teleop_hand_and_arm.py --xr-source xrlink. Baked into
     the APK, so a new address means a new build.
@@ -21,10 +27,12 @@
     in, and 'Allow USB debugging' accepted on the device.
 
 .EXAMPLE
-    .\tools\build_quest_apk.ps1 -HostAddress 192.168.123.2 -Install
+    .\tools\build_quest_apk.ps1 -Robot G1 -HostAddress 192.168.123.3 -Install
 #>
 [CmdletBinding()]
 param(
+    [ValidateSet("G1", "R1")]
+    [string]$Robot = "G1",
     [string]$HostAddress = "192.168.123.2",
     [int]$Port = 8443,
     [switch]$Tls,
@@ -42,7 +50,7 @@ $project = Join-Path $repo "quest_app"
 if (-not (Test-Path (Join-Path $project "Assets/Editor/QuestBuild.cs"))) {
     throw "quest_app does not look like the teleop Unity project: $project"
 }
-if ($Output -eq "") { $Output = Join-Path $project "Build/G1Teleop.apk" }
+if ($Output -eq "") { $Output = Join-Path $project "Build/${Robot}Teleop.apk" }
 
 # ---------------------------------------------------------------- toolchain
 function Find-Unity {
@@ -98,6 +106,7 @@ $buildArgs = @(
     "-executeMethod", "WeGo.Teleop.Editor.QuestBuild.Build",
     "-logFile", $log,
     "--",
+    "-robot", $Robot,
     "-host", $HostAddress,
     "-port", $Port,
     "-output", $Output,
@@ -108,6 +117,7 @@ if ($Development) { $buildArgs += "-development" }
 
 Write-Host "Unity   : $unity"
 Write-Host "Project : $project"
+Write-Host "Robot   : $Robot"
 Write-Host "Target  : $(if ($Tls) { 'wss' } else { 'ws' })://${HostAddress}:${Port}"
 Write-Host "Output  : $Output"
 Write-Host "Log     : $log"

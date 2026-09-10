@@ -26,6 +26,12 @@ namespace WeGo.Teleop
         public int Port = 8443;
         public bool UseTls = false;
 
+        [Tooltip("Which robot this build is for: G1 or R1. Set by QuestBuild " +
+                 "-robot; each robot ships as its own app with its own " +
+                 "package id, so an operator cannot open the wrong one by " +
+                 "picking the wrong model at runtime.")]
+        public string Robot = "G1";
+
         [Header("Passthrough")]
         [Tooltip("Alignment happens in passthrough so the operator can see the " +
                  "real robot they are matching. Turning this off makes the " +
@@ -102,6 +108,7 @@ namespace WeGo.Teleop
             session.HostAddress = HostAddress;
             session.Port = Port;
             session.UseTls = UseTls;
+            session.AppRobot = Robot;
 
             // The stage renders before the HUD reads its texture, so it is
             // added first.

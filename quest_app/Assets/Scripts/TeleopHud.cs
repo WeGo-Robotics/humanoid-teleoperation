@@ -262,7 +262,7 @@ namespace WeGo.Teleop
             _facing.text = $"facing {Mathf.RoundToInt(Mathf.DeltaAngle(0f, e.y))}°   ·   " +
                            $"pitch {-Mathf.RoundToInt(Mathf.DeltaAngle(0f, e.x))}°";
 
-            _posture.text = aligning ? "HUMANOID POSTURE: STANDING G1"
+            _posture.text = aligning ? $"HUMANOID POSTURE: STANDING {Session.AppRobot}"
                                      : $"HUMANOID POSTURE: {state}";
 
             _pill.text = state;
@@ -272,6 +272,12 @@ namespace WeGo.Teleop
             _message.text = string.IsNullOrEmpty(Session.AlignReason)
                 ? (aligning ? "hold both triggers to confirm" : DefaultMessage(state))
                 : Session.AlignReason;
+            // Overrides everything else on the line: an operator aligning to
+            // a picture of the wrong robot needs to know that before anything
+            // the host has to say about the pose.
+            if (Session.RobotMismatch)
+                _message.text = $"WRONG APP: this is the {Session.AppRobot} app, " +
+                                $"the host is driving {Session.Robot}";
 
             // Both triggers are held for the WHOLE gate, skip included -- X + A
             // only waives the position check, it does not replace the confirm
@@ -676,7 +682,7 @@ namespace WeGo.Teleop
             var tipTop = ColTop - 360f - Gap - 420f - Gap;
             var tip = Panel(root, new Vector2(Pad, tipTop), new Vector2(SideW, 272f), "Tip");
 
-            var figure = Resources.Load<Texture2D>("g1_reference");
+            var figure = Resources.Load<Texture2D>($"{Session.AppRobot.ToLowerInvariant()}_reference");
             var textX = 24f;
             if (figure != null)
             {
@@ -765,7 +771,7 @@ namespace WeGo.Teleop
                   new Vector2(StageW - 8f, StageH - 8f));
 
             // REFERENCE badge, bottom-right of the stage, as in the mock.
-            var badge = Resources.Load<Texture2D>("g1_reference");
+            var badge = Resources.Load<Texture2D>($"{Session.AppRobot.ToLowerInvariant()}_reference");
             if (badge != null)
             {
                 const float bh = 190f;
