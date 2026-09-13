@@ -402,7 +402,7 @@ Shipped and unit-tested. Works against the **existing Vuer browser flow** — no
 | Safety layer (new) | `teleop/safety/` | `XRWatchdog` (staleness · freeze · seq · validity), `JumpGuard` (anomaly trips + Cartesian rate limit), `SafetyFSM` (latching state machine), shared types |
 | XR liveness | `televuer.py` | Per-event sequence + monotonic stamps in shared memory; session attach/detach tracked around the spawn coroutine; handler errors logged (throttled) instead of swallowed |
 | XR liveness | `tv_wrapper.py` | New `XRLinkStatus`, paired with each `get_tele_data()`; surfaces the `safe_mat_update` validity flags that were previously computed and discarded |
-| Safe-stop | `robot_control/arm_safety.py` (new) | `ArmSafetyMixin`: `hold()`, `release_hold()`, `set_velocity_limit()`, `restore_velocity_limit()`, `safe_stop()`; mixed into all five controllers |
+| Safe-stop | `robot_control/arm_safety.py` (new) | `ArmSafetyMixin`: `hold()`, `release_hold()`, `set_velocity_limit()`, `restore_velocity_limit()`, `glide_home()`, `safe_stop()`; mixed into all five controllers. Homing slows the *target* (minimum-jerk, 1 rad/s peak, gravity feed-forward along the path) and never lowers the velocity ceiling -- that ceiling caps PD torque, and at 3 rad/s it left the real arms unable to reach home |
 | Control loop | `teleop_hand_and_arm.py` | Gate before the EE arrays, locomotion and IK; arm/disarm on the START edge; `[e]` e-stop, `[a]` acknowledge; safety telemetry on the heartbeat |
 | Console | `dashboard.py` | XR headset panel (link · worn · staleness · safety state · reason), 시작 gated with a reason tooltip, 비상 정지 and 안전정지 해제 buttons, telemetry decays when heartbeats stop |
 | IPC | `utils/ipc.py` | `CMD_ESTOP`, `CMD_ACK_FAULT` |

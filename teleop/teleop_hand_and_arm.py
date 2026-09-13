@@ -615,10 +615,10 @@ if __name__ == '__main__':
             # Every way out lands here: CMD_ESTOP, CMD_STOP, the controller's A
             # button, and a SIGTERM. Leaving following latched off
             # is not enough on its own: it leaves the arms wherever the operator
-            # abandoned them, mid-reach. Bring them home under the reduced
-            # SAFE_ARM_VELOCITY ceiling first -- `safe_stop` freezes before it
-            # slows before it homes, so whatever motion was in flight is arrested
-            # before the (large) trip home starts -- and only then begin the exit.
+            # abandoned them, mid-reach. Bring them home slowly first --
+            # `safe_stop` freezes before it homes, so whatever motion was in
+            # flight is arrested before the (large) trip home starts -- and only
+            # then begin the exit.
             if SHUTDOWN_REQUEST:
                 _why = SHUTDOWN_REQUEST
                 SHUTDOWN_REQUEST = None
@@ -632,7 +632,7 @@ if __name__ == '__main__':
                     except Exception as e:
                         logger_mp.error(f"Failed to stop locomotion on {_why}: {e}")
                 try:
-                    arm_ctrl.safe_stop(go_home=True)
+                    arm_ctrl.safe_stop(go_home=True, gravity=arm_ik.gravity_torque)
                     homed_on_shutdown = True
                 except Exception as e:
                     logger_mp.error(f"Failed to home arms on {_why}: {e}")
@@ -820,7 +820,8 @@ if __name__ == '__main__':
                 was_following = False
                 if args.input_mode == "controller" and args.motion:
                     loco_wrapper.Move(0, 0, 0)
-                arm_ctrl.safe_stop(go_home=args.safe_stop_home)
+                arm_ctrl.safe_stop(go_home=args.safe_stop_home,
+                                   gravity=arm_ik.gravity_torque)
                 if RECORD_RUNNING:
                     # Deliberately not auto-saved: an episode that ends in a
                     # fault is usually not a demonstration worth keeping, and
@@ -1041,9 +1042,9 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
-            # A prior safe stop leaves the velocity ceiling at SAFE_ARM_VELOCITY.
-            # ctrl_dual_arm_go_home() gives up after ~5s, so leaving it there
-            # would strand the arms part-way through the exit move.
+            # Clear any hold and gradual ramp so the exit go-home below tracks
+            # its target at the nominal ceiling; ctrl_dual_arm_go_home() gives
+            # up after ~5s, and anything slower strands the arms part-way.
             arm_ctrl.release_hold()
             arm_ctrl.restore_velocity_limit()
         except Exception as e:

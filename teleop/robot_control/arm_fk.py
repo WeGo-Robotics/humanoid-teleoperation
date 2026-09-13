@@ -40,3 +40,22 @@ class ArmFKMixin:
             except Exception:
                 pass
             return None, None
+
+    def gravity_torque(self, q):
+        """Joint torques that hold configuration `q` still against gravity.
+
+        The same call `solve_ik` makes for its feed-forward -- rnea at zero
+        velocity and acceleration -- but at any pose, so a move that does not
+        come from the IK (the safe-stop glide home) can still carry a correct
+        feed-forward. Own `Data`, so it cannot disturb the IK's cached state.
+        Raises on failure; the caller chooses the fallback.
+        """
+        import pinocchio as pin
+        model = self.reduced_robot.model
+        if getattr(self, "_gravity_data", None) is None:
+            self._gravity_data = model.createData()
+        q = np.asarray(q, dtype=float).reshape(-1)
+        if q.shape[0] != model.nq:
+            raise ValueError(f"expected {model.nq} joint values, got {q.shape[0]}")
+        zero = np.zeros(model.nv)
+        return np.array(pin.rnea(model, self._gravity_data, q, zero, zero))

@@ -37,11 +37,24 @@ class FakeArm(ArmSafetyMixin):
     def __init__(self, measured=None, has_state=True):
         self.ctrl_lock = threading.Lock()
         self.q_target = np.zeros(14)
+        self.tauff_target = np.full(14, 2.5)   # the IK's feed-forward at the last pose
         self.arm_velocity_limit = 20.0
         self._speed_gradual_max = False
         self._measured = measured if measured is not None else np.full(14, 0.7)
         self._has_state = has_state
         self.home_calls = 0
+        # Simulated clock, and every (time, q_target, tauff_target) the homing
+        # move commanded -- what the 250Hz control thread would have seen.
+        self.clock = 0.0
+        self.commanded = []
+
+    def _now(self):
+        return self.clock
+
+    def _wait(self, seconds):
+        self.commanded.append((self.clock, self.q_target.copy(),
+                               self.tauff_target.copy()))
+        self.clock += seconds
 
     def get_current_dual_arm_q(self):
         if not self._has_state:
@@ -51,6 +64,11 @@ class FakeArm(ArmSafetyMixin):
     def ctrl_dual_arm_go_home(self):
         self.home_calls += 1
         self.q_target = np.zeros(14)
+
+
+def fake_gravity(q):
+    """Stands in for the IK model: any smooth function of the pose will do."""
+    return 3.0 * np.cos(q)
 
 
 class TestHold(unittest.TestCase):
@@ -110,31 +128,41 @@ class TestVelocityLimit(unittest.TestCase):
 
 
 class TestSafeStop(unittest.TestCase):
-    def test_freezes_before_slowing_and_homing(self):
+    def test_freezes_before_gliding_home_then_settles(self):
         order = []
         arm = FakeArm(measured=np.full(14, 0.7))
 
-        real_hold, real_limit, real_home = (
-            arm.hold, arm.set_velocity_limit, arm.ctrl_dual_arm_go_home)
+        real_hold, real_glide, real_home = (
+            arm.hold, arm.glide_home, arm.ctrl_dual_arm_go_home)
         arm.hold = lambda: (order.append("hold"), real_hold())[1]
-        arm.set_velocity_limit = lambda v: (order.append(f"limit:{v}"),
-                                            real_limit(v))[1]
+        arm.glide_home = lambda g=None: (order.append("glide"), real_glide(g))[1]
         arm.ctrl_dual_arm_go_home = lambda: (order.append("home"), real_home())[1]
 
         arm.safe_stop()
-        self.assertEqual(order, ["hold", f"limit:{ArmSafetyMixin.SAFE_ARM_VELOCITY}",
-                                 "home"])
+        self.assertEqual(order, ["hold", "glide", "home"])
 
-    def test_homes_at_the_reduced_velocity(self):
+    def test_never_lowers_the_velocity_ceiling(self):
+        """The regression that twisted the real arms on e-stop.
+
+        `clip_arm_q_target` steps from the *measured* position, so the ceiling
+        is really a cap on how far the command may lead the arm -- a torque
+        cap. At the 3 rad/s this used to set, that cap was below gravity: the
+        arms could not be driven home and drifted. Simulation skips the clip,
+        so it never showed there. The slowness belongs in the target path.
+        """
         arm = FakeArm()
+        arm.arm_velocity_limit = 3.0              # left low by an earlier stop
+        arm._speed_gradual_max = True
         arm.safe_stop()
-        self.assertEqual(arm.arm_velocity_limit, ArmSafetyMixin.SAFE_ARM_VELOCITY)
+        self.assertEqual(arm.arm_velocity_limit, ArmSafetyMixin.NOMINAL_ARM_VELOCITY)
+        self.assertFalse(arm._speed_gradual_max)
         self.assertEqual(arm.home_calls, 1)
 
     def test_freeze_only_mode_does_not_home(self):
         arm = FakeArm(measured=np.full(14, 0.7))
         arm.safe_stop(go_home=False)
         self.assertEqual(arm.home_calls, 0)
+        self.assertEqual(arm.commanded, [], "freeze-only must not move the target")
         np.testing.assert_allclose(arm.q_target, np.full(14, 0.7))
 
     def test_survives_a_failing_go_home(self):
@@ -144,12 +172,90 @@ class TestSafeStop(unittest.TestCase):
             raise RuntimeError("dds down")
         arm.ctrl_dual_arm_go_home = boom
         arm.safe_stop()                        # must not propagate
-        self.assertEqual(arm.arm_velocity_limit, ArmSafetyMixin.SAFE_ARM_VELOCITY)
+        self.assertFalse(arm._hold_engaged)
 
     def test_leaves_hold_released_for_the_next_arm_cycle(self):
         arm = FakeArm()
         arm.safe_stop()
         self.assertFalse(arm._hold_engaged)
+
+    def test_passes_the_gravity_model_to_the_glide(self):
+        arm = FakeArm(measured=np.full(14, 0.7))
+        arm.safe_stop(gravity=fake_gravity)
+        np.testing.assert_allclose(arm.tauff_target, fake_gravity(np.zeros(14)))
+
+
+class TestGlideHome(unittest.TestCase):
+    def glide(self, start, gravity=None):
+        arm = FakeArm(measured=np.asarray(start, dtype=float))
+        arm.hold()
+        arm.glide_home(gravity)
+        return arm
+
+    def test_starts_where_it_was_and_ends_exactly_home(self):
+        arm = self.glide(np.linspace(-1.2, 1.5, 14))
+        np.testing.assert_allclose(arm.commanded[0][1], np.linspace(-1.2, 1.5, 14))
+        np.testing.assert_array_equal(arm.q_target, np.zeros(14))
+
+    def test_peak_speed_is_bounded(self):
+        arm = self.glide(np.full(14, 2.0))
+        times = [c[0] for c in arm.commanded] + [arm.clock]
+        targets = [c[1] for c in arm.commanded] + [arm.q_target]
+        speeds = [np.max(np.abs(b - a)) / (tb - ta)
+                  for (ta, a), (tb, b) in zip(zip(times, targets),
+                                              zip(times[1:], targets[1:]))]
+        self.assertLessEqual(max(speeds), ArmSafetyMixin.HOME_PEAK_SPEED * 1.01)
+        # ...and it is not dawdling either: a minimum-jerk profile gets close.
+        self.assertGreater(max(speeds), ArmSafetyMixin.HOME_PEAK_SPEED * 0.9)
+
+    def test_starts_and_ends_without_a_velocity_step(self):
+        arm = self.glide(np.full(14, 2.0))
+        dt = 1.0 / ArmSafetyMixin.HOME_RATE_HZ
+        first = np.max(np.abs(arm.commanded[1][1] - arm.commanded[0][1])) / dt
+        last = np.max(np.abs(arm.q_target - arm.commanded[-1][1])) / dt
+        self.assertLess(first, 0.05 * ArmSafetyMixin.HOME_PEAK_SPEED)
+        self.assertLess(last, 0.05 * ArmSafetyMixin.HOME_PEAK_SPEED)
+
+    def test_every_joint_arrives_together(self):
+        """Proportional, not per-joint: the pose shrinks toward home along a
+        straight line in joint space instead of folding up one joint at a time."""
+        start = np.linspace(-1.0, 2.0, 14)
+        arm = self.glide(start)
+        for _, q, _ in arm.commanded[1:]:
+            ratio = q / start
+            np.testing.assert_allclose(ratio, ratio[0], atol=1e-9)
+
+    def test_a_short_trip_still_takes_the_minimum_time(self):
+        arm = self.glide(np.full(14, 0.01))
+        self.assertGreaterEqual(arm.clock, ArmSafetyMixin.HOME_MIN_S - 1e-9)
+
+    def test_already_home_is_harmless(self):
+        arm = self.glide(np.zeros(14))
+        np.testing.assert_array_equal(arm.q_target, np.zeros(14))
+
+    def test_feed_forward_follows_the_pose(self):
+        """The IK's torque was for the pose teleop left; carried unchanged it
+        pushes the arm off the path, and at home it is simply wrong."""
+        arm = self.glide(np.full(14, 1.2), gravity=fake_gravity)
+        for _, q, tau in arm.commanded:
+            np.testing.assert_allclose(tau, fake_gravity(q))
+        np.testing.assert_allclose(arm.tauff_target, fake_gravity(np.zeros(14)))
+
+    def test_without_a_model_the_feed_forward_is_left_alone(self):
+        arm = self.glide(np.full(14, 1.2))
+        np.testing.assert_allclose(arm.tauff_target, np.full(14, 2.5))
+
+    def test_a_failing_model_falls_back_instead_of_aborting_the_stop(self):
+        def broken(q):
+            raise RuntimeError("pinocchio exploded")
+        arm = self.glide(np.full(14, 1.2), gravity=broken)
+        np.testing.assert_array_equal(arm.q_target, np.zeros(14))
+        np.testing.assert_allclose(arm.tauff_target, np.full(14, 2.5))
+
+    def test_a_model_of_the_wrong_size_falls_back(self):
+        arm = self.glide(np.full(14, 1.2), gravity=lambda q: np.zeros(7))
+        np.testing.assert_array_equal(arm.q_target, np.zeros(14))
+        np.testing.assert_allclose(arm.tauff_target, np.full(14, 2.5))
 
 
 if __name__ == "__main__":

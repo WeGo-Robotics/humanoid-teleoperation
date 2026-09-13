@@ -1632,7 +1632,7 @@ class Dashboard(QWidget):
 
         # One stop, not two. [종료] and [비상 정지] used to differ -- 종료 exited,
         # 비상 정지 only latched following off -- but both now run the same path:
-        # freeze, drop to SAFE_ARM_VELOCITY, walk the arms home, exit, and let the
+        # freeze, glide the arms home slowly, exit, and let the
         # supervisor bring a fresh process back. Two buttons doing the identical
         # thing is worse than one: in the moment you need this, picking between
         # them is hesitation. The remaining ladder is 정지 (홈 복귀 후 홀드,
@@ -2049,7 +2049,7 @@ class Dashboard(QWidget):
             pass
         # shut down teleop process group if we launched it. The wait is
         # STOP_GRACE, not the 5s it used to be: the exit path now walks the arms
-        # home at SAFE_ARM_VELOCITY before it tears anything down, and the old
+        # home slowly before it tears anything down, and the old
         # timeout expired mid-move -- so closing the window SIGTERMed the child
         # partway through the very homing move that exists to avoid that.
         if self.proc and self.proc.poll() is None:
